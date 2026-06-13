@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.env
+.venv/
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Training artifacts
+*.msgpack
+training_metrics.csv
+training_metrics_1.png
+training_metrics_2.png
+treinos_antigos/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gemini IDE
+.gemini/
+
+# Temporary files
+ver.txt
