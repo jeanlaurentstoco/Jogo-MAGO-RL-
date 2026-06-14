@@ -56,7 +56,8 @@ class Renderer:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont("monospace", 15)
         self.font_small = pygame.font.SysFont("monospace", 12)
-        self.engine = GameEngine(map_size=MAP_SIZE, num_frames=NUM_FRAMES)
+        # Inicializar engine em is_training=True se o Bot for usado para manter simetria perfeita
+        self.engine = GameEngine(map_size=MAP_SIZE, num_frames=NUM_FRAMES, is_training=(model_file != ""))
         self.curriculum_progress = curriculum_progress
         self.engine.reset(curriculum_progress=self.curriculum_progress)
         
@@ -90,17 +91,12 @@ class Renderer:
     def render(self, state):
         self.screen.fill(COLOR_BG)
         
-        # Obter limites da arena
+        # Obter limites da arena diretos da engine
         progress = state.get("curriculum_progress", self.curriculum_progress)
-        engine_temp = GameEngine.__new__(GameEngine)
-        engine_temp.map_size = MAP_SIZE
-        engine_temp.arena_size_min = 28
-        engine_temp.arena_size_max = MAP_SIZE - 2
-        engine_temp.curriculum_progress = progress
-        arena_min, arena_max = engine_temp.get_arena_bounds()
+        arena_min, arena_max = self.engine.get_arena_bounds()
         
-        # Hitbox dinâmica via LERP
-        hitbox_radius = 12.0 + (1.0 - 12.0) * progress  # max→min com progress
+        # Hitbox visual exata ditada pela engine física
+        hitbox_radius = self.engine.lerp(self.engine.hitbox_radius_max, self.engine.hitbox_radius_min, progress)
         
         # 1. Desenhar Paredes, Drops e Arena
         walls = state["walls"]
@@ -245,6 +241,28 @@ class Renderer:
             "shoot": mouse_buttons[0] # Botão esquerdo
         }
 
+    def get_intent_from_state(self, state):
+        intent = np.zeros(11, dtype=np.float32)
+        p_hp = state["player_stats"][0]
+        e_hp = state["enemy_stats"][0]
+        dist = np.linalg.norm(state["player_pos"] - state["enemy_pos"])
+        
+        if e_hp <= 10: intent[3] = 1.0
+        elif p_hp < 30: intent[4] = 1.0
+        elif e_hp < 50 and dist > 15: intent[0] = 1.0
+        elif dist < 8: intent[6] = 1.0
+        elif dist > 30: intent[0] = 1.0
+        else: intent[8] = 1.0
+            
+        if p_hp > 50:
+            drop_positions = np.argwhere(state.get("drops", np.zeros((64, 64))) == 1) if "drops" in state else []
+            if len(drop_positions) > 0:
+                dists_to_drops = np.linalg.norm(drop_positions - state["player_pos"], axis=1)
+                if np.min(dists_to_drops) < 8.0:
+                    intent = np.zeros(11, dtype=np.float32)
+                    intent[10] = 1.0
+        return intent
+
     def run(self):
         state = self.engine.get_state()
         running = True
@@ -256,8 +274,8 @@ class Renderer:
                     
             action = self.get_action_from_input()
             
-            # LLM Removido
-            # self.engine.current_intent = intent
+            # Recalcula a intenção localmente para exibir na tela
+            self.engine.current_intent = self.get_intent_from_state(state)
             self.game_tick += 1
             
             # ---------------------------------------------
@@ -324,19 +342,13 @@ class Renderer:
                     
                     enemy_action = {"move_idx": move_idx, "aim": aim, "shoot": shoot}
 
-            state, reward, done, _ = self.engine.step(action, enemy_action=enemy_action, curriculum_progress=self.curriculum_progress)
-            
-            self.render(state)
+            state, reward, done, stats = self.engine.step(action, enemy_action=enemy_action, curriculum_progress=self.curriculum_progress)
             
             if done:
-                if state["enemy_stats"][0] <= 0:
-                    print("Vitória! Inimigo derrotado.")
-                elif state["player_stats"][0] <= 0:
-                    print("Derrota! Você morreu.")
-                else:
-                    print("Game Over: Tempo Esgotado!")
+                print(f"Game Over: {stats.get('episode_result', '???')}")
                 self.engine.reset(curriculum_progress=self.curriculum_progress)
                 state = self.engine.get_state()
+            self.render(state)
                 
             self.clock.tick(30) # 30 FPS
             

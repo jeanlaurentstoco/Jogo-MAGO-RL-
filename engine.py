@@ -3,11 +3,12 @@ import heapq
 import queue
 
 class GameEngine:
-    def __init__(self, map_size=64, max_projectiles=128, headless=True, num_frames=16):
+    def __init__(self, map_size=64, max_projectiles=128, headless=True, num_frames=16, is_training=False):
         self.map_size = map_size
         self.max_projectiles = max_projectiles
         self.headless = headless
         self.num_frames = num_frames
+        self.is_training = is_training
         self.channels_per_frame = 5
         
         # Action Map: 0: Stay, 1: North (0, -1), 2: South (0, 1), 3: East (1, 0), 4: West (-1, 0)
@@ -20,25 +21,32 @@ class GameEngine:
         
         # --- LIMITES FÍSICOS (LERP) ---
         # Hitbox: começa colossal (fácil acertar) e encolhe até realista
-        self.hitbox_radius_max = 12.0   # Em progress=0.0 (alvo colossal)
-        self.hitbox_radius_min = 1.0    # Em progress=1.0 (alvo realista)
-        
-        # HP do Inimigo: começa fraco e fica resistente
-        self.enemy_hp_min = 30.0        # Em progress=0.0
-        self.enemy_hp_max = 100.0       # Em progress=1.0
-        
-        # Velocidade do Inimigo: parado → rápido
-        self.enemy_speed_min = 0.0      # Congelado em 0.0
-        self.enemy_speed_max = 0.5      # Velocidade máxima em 1.0
-        
-        # Velocidade dos Projéteis do Inimigo: lento → 3x vel. andar do player
         self.player_speed_base = 0.5    # Velocidade base do player (referência)
-        self.enemy_proj_speed_min = 0.5 # ≈ velocidade do player andando
-        self.enemy_proj_speed_max = 1.5 # 3x velocidade do player
         
-        # Intervalo de Tiro do Inimigo (em ticks): lento → rápido
-        self.enemy_shoot_interval_min = 40  # Tiro muito lento
-        self.enemy_shoot_interval_max = 2  # Tiro cadenciado 
+        if self.is_training:
+            self.enemy_hp_min = 300.0
+            self.enemy_hp_max = 300.0
+            self.player_hp_base = 300.0
+        else:
+            self.enemy_hp_min = 30.0        # Em progress=0.0
+            self.enemy_hp_max = 100.0       # Em progress=1.0
+            self.player_hp_base = 100.0
+            
+        # Velocidade do Inimigo: parado → rápido (Igual ao player em p=1.0)
+        self.enemy_speed_min = 0.0
+        self.enemy_speed_max = 0.5
+        
+        # Velocidade dos Projéteis do Inimigo (Igual ao player em p=1.0)
+        self.enemy_proj_speed_min = 0.5
+        self.enemy_proj_speed_max = 1.5
+        
+        # Intervalo de Tiro do Inimigo: lento → rápido (Igual ao player em p=1.0)
+        self.enemy_shoot_interval_min = 40
+        self.enemy_shoot_interval_max = 3
+        
+        # Hitbox do Inimigo: colossal → realista (Igual ao player em p=1.0)
+        self.hitbox_radius_max = 12.0
+        self.hitbox_radius_min = 1.0 
         
         # --- ARENA DINÂMICA (Jaula de Vidro) ---
         # A observação NUNCA muda de shape. A arena jogável cresce.
@@ -47,7 +55,7 @@ class GameEngine:
         
         # --- LIMIARES DE DESBLOQUEIO (Threshold Masking) ---
         self.threshold_movement = 0.1   # Movimento liberado
-        self.threshold_bounce = 0.4     # Ricochete de projéteis ativado
+        self.threshold_bounce = 0.6     # Ricochete de projéteis ativado
         self.threshold_maze_walls = 0.45  # Paredes internas aparecem
         
         # --- LIMIARES DE IA INIMIGA ---
@@ -58,7 +66,7 @@ class GameEngine:
         # --- SISTEMA DE INTENÇÕES TÁTICAS ---
         self.num_intents = 11
         self.current_intent = np.zeros(self.num_intents, dtype=np.float32)
-        self.intent_scale = 0.5  # Multiplicador global das recompensas táticas
+        self.intent_scale = 1.5  # Multiplicador global das recompensas táticas (triplicado para forçar o aprendizado)
         self.event_queue = queue.Queue()  # Fila thread-safe para eventos de gameplay
         
         self.reset()
@@ -94,7 +102,8 @@ class GameEngine:
         self.visited_coords = np.zeros((self.map_size, self.map_size), dtype=bool)
         self.map_drops = np.zeros((self.map_size, self.map_size), dtype=np.int32)
         
-        self.player_stats = np.array([100, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+        # O HP base depende se estamos no treino ou jogo normal
+        self.player_stats = np.array([self.player_hp_base, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
         
         # HP do Inimigo via LERP
         enemy_hp = self.lerp(self.enemy_hp_min, self.enemy_hp_max, p)
@@ -143,7 +152,15 @@ class GameEngine:
         self.player_idle_ticks = 0
         self.player_flee_ticks = 0
         self.player_cornered_ticks = 0
+        self.consecutive_hits = 0
+        self.last_hit_tick = 0
         self.death_reason = "em combate"
+        
+        # Esvazia a fila antiga (se existir) para evitar eco de vidas passadas
+        if hasattr(self, 'event_queue'):
+            while not self.event_queue.empty():
+                try: self.event_queue.get_nowait()
+                except queue.Empty: break
         
         self._spawn_entities()
             
@@ -553,7 +570,7 @@ class GameEngine:
             step_reward += 0.3
             self.reward_from_drops += 0.3
             
-            self.player_stats[0] = min(100, self.player_stats[0] + 20)
+            self.player_stats[0] = min(self.player_hp_base, self.player_stats[0] + 20)
             
             if p < 0.15:
                 self._spawn_drop_at_distance(3.0)
@@ -567,6 +584,10 @@ class GameEngine:
         e o vetor one-hot de intenção, isolando apenas a meta ativa.
         """
         if not np.any(self.current_intent > 0):
+            return 0.0
+            
+        # O agente não pode receber recompensas ou punições de movimentação tática se ainda não tem permissão para andar
+        if self.curriculum_progress < self.threshold_movement:
             return 0.0
         
         rewards = np.zeros(self.num_intents, dtype=np.float32)
@@ -649,45 +670,56 @@ class GameEngine:
         if self.prev_enemy_wall_dist is not None:
             wall_delta = enemy_wall_dist - self.prev_enemy_wall_dist
         
-        # 0: AGRESSIVO_PERSEGUIR — recompensa redução de distância
+        # 0: AGRESSIVO_PERSEGUIR — recompensa redução de distância, penaliza distanciamento
         if dist_delta < -0.1:
             rewards[0] = 0.1
+        elif dist_delta > 0.1:
+            rewards[0] = -0.1
         
-        # 1: FLANQUEAR — recompensa estar fora do cone de mira inimigo
+        # 1: FLANQUEAR — recompensa estar fora do cone de mira inimigo, penaliza movimento frontal/inércia
         to_player = self.player_pos - self.enemy_pos
         to_player_norm = np.linalg.norm(to_player)
         if to_player_norm > 0:
             to_player_dir = to_player / to_player_norm
-            # Cone de mira heurístico: inimigo olha para o player
-            # Se agente está na lateral (cos < 0.5), está flanqueando
             if self.prev_move_dir is not None:
                 move_norm = np.linalg.norm(self.prev_move_dir)
                 if move_norm > 0:
                     lateral = abs(np.cross(to_player_dir, self.prev_move_dir / move_norm))
                     if lateral > 0.5:
                         rewards[1] = 0.1
+                    else:
+                        rewards[1] = -0.1
         
-        # 2: FORCAR_CANTO — recompensa inimigo perto de parede
+        # 2: FORCAR_CANTO — recompensa inimigo perto de parede, penaliza inimigo indo pro meio
         if wall_delta < -0.1:
             rewards[2] = 0.1
+        elif wall_delta > 0.1:
+            rewards[2] = -0.1
         
-        # 3: ALL_IN_LETAL — multiplicador de hit (aplicado separadamente nos hits)
+        # 3: ALL_IN_LETAL — recompensa por atirar com inimigo quase morto, penaliza hesitação
         if self.enemy_stats[0] < 20:
             if self.shot_this_tick:
-                rewards[3] = 0.5  # Bônus por atirar com inimigo quase morto
+                rewards[3] = 0.5
+            else:
+                rewards[3] = -0.2  # Punição por não aproveitar a chance
+        else:
+            rewards[3] = -0.1 # Punição por ativar all-in com o inimigo com HP alto
         
-        # 4: EVASIVO_RECUAR — recompensa aumento de distância
+        # 4: EVASIVO_RECUAR — recompensa aumento de distância, penaliza aproximação
         if dist_delta > 0.1:
             rewards[4] = 0.1
+        elif dist_delta < -0.1:
+            rewards[4] = -0.1
         
-        # 5: BUSCAR_COBERTURA — recompensa LOS bloqueado
+        # 5: BUSCAR_COBERTURA — recompensa LOS bloqueado, penaliza ficar em campo aberto
         if not self.check_los():
             rewards[5] = 0.1
+        else:
+            rewards[5] = -0.1
         
-        # 6: MOVIMENTO_ERRATICO — recompensa mudança brusca de direção
+        # 6: MOVIMENTO_ERRATICO — recompensa mudança brusca de direção, penaliza inércia retilínea
         if self.prev_move_dir is not None and self.last_aim_vec is not None:
             if np.linalg.norm(self.prev_move_dir) > 0:
-                # Penaliza inércia retilínea, recompensa mudança
                 dot = np.dot(self.prev_move_dir, self.pos_history[-1] - self.pos_history[-2]) if self.tick > 2 else 0
                 if abs(dot) < 0.3:
                     rewards[6] = 0.05
@@ -700,23 +732,31 @@ class GameEngine:
         else:
             rewards[7] = 0.05
         
-        # 8: CONTROLE_TERRITORIAL — recompensa proximidade do centro
+        # 8: CONTROLE_TERRITORIAL — recompensa proximidade do centro, penaliza bordas
         arena_half = (arena_max - arena_min) / 2.0
         if dist_to_center < arena_half * 0.3:
             rewards[8] = 0.05
+        else:
+            rewards[8] = -0.05
         
-        # 9: PATRULHA_PERIMETRAL — recompensa manter distância constante
+        # 9: PATRULHA_PERIMETRAL — recompensa manter distância, penaliza oscilações grandes
         if self.prev_dist_to_enemy is not None:
             if abs(dist_delta) < 0.3 and dist_to_enemy > 10:
                 rewards[9] = 0.05
+            else:
+                rewards[9] = -0.05
         
-        # 10: CAZAR_RECURSOS — recompensa proximidade a drops
+        # 10: CAZAR_RECURSOS — recompensa proximidade a drops, penaliza desperdício de tempo
         drop_positions = np.argwhere(self.map_drops == 1)
         if len(drop_positions) > 0:
             dists_to_drops = np.linalg.norm(drop_positions - self.player_pos, axis=1)
             closest_drop_dist = np.min(dists_to_drops)
             if closest_drop_dist < 5.0:
                 rewards[10] = 0.2
+            else:
+                rewards[10] = -0.1
+        else:
+            rewards[10] = -0.1  # Ativou caçar com mapa limpo
         
         # Atualiza estado anterior para próximo tick
         self.prev_dist_to_enemy = dist_to_enemy
@@ -901,7 +941,23 @@ class GameEngine:
                         self.reward_from_penalties -= wall_miss_penalty
                     self.proj_active[idx_hit] = False
                 else:
-                    self.proj_vel[idx_hit] *= -1
+                    # Ricochete realístico para colisões internas
+                    prev_pos = self.proj_pos[idx_hit] - self.proj_vel[idx_hit]
+                    prev_x = np.clip(prev_pos[:, 0].astype(int), 0, self.map_size-1)
+                    prev_y = np.clip(prev_pos[:, 1].astype(int), 0, self.map_size-1)
+                    curr_x = px_int[hit_wall]
+                    curr_y = py_int[hit_wall]
+                    
+                    flip_x = self.map_walls[curr_x, prev_y] == 1
+                    flip_y = self.map_walls[prev_x, curr_y] == 1
+                    
+                    # Quina perfeita: se nem X nem Y for parede (mas a diagonal for), inverte os dois
+                    corner = (~flip_x) & (~flip_y)
+                    flip_x = flip_x | corner
+                    flip_y = flip_y | corner
+                    
+                    self.proj_vel[idx_hit, 0] = np.where(flip_x, -self.proj_vel[idx_hit, 0], self.proj_vel[idx_hit, 0])
+                    self.proj_vel[idx_hit, 1] = np.where(flip_y, -self.proj_vel[idx_hit, 1], self.proj_vel[idx_hit, 1])
                     self.proj_bounces[idx_hit] += 1
                 
             too_many = self.proj_bounces[active] > 3
@@ -985,9 +1041,20 @@ class GameEngine:
                     self.proj_owner[idx_player_hit] = 0 
                 else:
                     hits = np.sum(hit_player)
+                    
+                    if self.tick - self.last_hit_tick <= 30: # 1 segundo (30 ticks)
+                        self.consecutive_hits += hits
+                    else:
+                        self.consecutive_hits = hits
+                    self.last_hit_tick = self.tick
+                    
+                    base_penalty = hits * 1.0
+                    combo_penalty = (self.consecutive_hits - 1) * 0.2 if self.consecutive_hits > 1 else 0.0
+                    total_penalty = base_penalty + combo_penalty
+                    
                     self.player_stats[0] -= hits * 10
-                    reward -= hits * 1.0
-                    self.reward_from_penalties -= hits * 1.0
+                    reward -= total_penalty
+                    self.reward_from_penalties -= total_penalty
                     self.proj_active[idx_player_hit] = False
                     
         # --- GERAÇÃO DINÂMICA DE ITENS (Dense Reward Signal) ---
@@ -1150,8 +1217,9 @@ class GameEngine:
             except queue.Full:
                 pass
             
-        # Timeout dinâmico via LERP
-        max_ticks = int(self.lerp(75, 1000, p))
+        # Escala o tempo limite proporcionalmente à vida (para dar tempo de se matarem com 1000 HP)
+        hp_multiplier = self.player_hp_base / 100.0
+        max_ticks = int(self.lerp(75, 1000, p) * hp_multiplier)
 
         if self.tick >= max_ticks:
             reward -= 50.0  # Penalidade de timeout extrema

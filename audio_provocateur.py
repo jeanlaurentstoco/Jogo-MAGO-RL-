@@ -90,63 +90,97 @@ class AudioProvocateur(threading.Thread):
         pass
     
     def _get_hardcoded_taunt(self, event):
-        """Retorna um taunt hardcoded aleatório caso o Gemini esteja indisponível."""
+        """Retorna um taunt hardcoded aleatório de alta provocação caso a geração falhe."""
         event_type = event.get("type")
         
         taunts = {
             "enemy_miss_streak": [
                 "Você é cego ou apenas incompetente? Sua magia é fraca!",
-                "Você atira no ar enquanto eu leio o tecido da realidade!",
+                "Você atira no ar enquanto eu manipulo as strings da realidade!",
                 "Sua mira é tão patética quanto a sua linhagem, humano!",
-                "Desista! Você não passa de um inseto cego perante um Mago Supremo!"
+                "Desista! Você não passa de um inseto cego perante um Mago Supremo!",
+                "Estou calculando os vetores da sua incompetência. É fascinante.",
+                "O ar está sangrando, mas minha barreira de mana continua intacta, verme.",
+                "Golpear o vazio é a base da sua escola de combate ou apenas dano cerebral?",
+                "Minha presença passiva exige mais destreza do que você jamais terá em toda a vida.",
+                "Você estuda espadas e flechas enquanto eu reescrevo as leis da termodinâmica local.",
+                "Nem um constructo defeituoso de argila erraria ataques com tamanha precisão estatística."
             ],
             "player_combo": [
                 "Acha que essa faísca me machuca? Eu sou a própria tempestade!",
                 "Seus golpes são apenas cócegas na armadura do arcano!",
-                "Desfrute do seu momento de glória, mortal. Ele será o último!"
+                "Desfrute do seu momento de glória, mortal. Ele será o último!",
+                "Toda essa coreografia patética para arranhar meus escudos ilusórios?",
+                "Batendo contra mana cristalizado com força bruta? A ignorância é comovente.",
+                "Aproveite o acúmulo de ácido lático; minha retaliação vai evaporar seus ossos.",
+                "Cada acerto seu apenas serve como catalisador para a maldição que já está no seu sangue.",
+                "Isso é o melhor do seu arsenal? Estou recebendo mais dano por tédio do que por seus ataques.",
+                "Sua persistência beira a demência. Você está lutando contra a entropia pura!"
             ],
             "enemy_low_hp": [
-                "Você acha que eu sangro? O que escorre de mim é pura magia!",
-                "A dor apenas alimenta o meu poder! Trema perante mim!",
-                "Eu já retornei das cinzas centenas de vezes. Você morre apenas uma vez!"
+                "Você acha que eu sangro? O que escorre de mim é plasma dimensional!",
+                "A dor física apenas remove a trava de segurança do meu poder. Trema!",
+                "Eu já retornei das cinzas centenas de vezes. Você, mortal, apodrece apenas uma vez!",
+                "A casca cede, mas meu núcleo astral está prestes a entrar em colapso crítico!",
+                "Você não me feriu; você apenas quebrou os selos que limitavam minha destruição em área!",
+                "Até colapsando em poeira cósmica, eu conjuro cataclismos que sua mente símea não compreende!",
+                "Meu sangue fervente queima os alicerces do seu mundo de vermes!",
+                "O abismo me exige de volta, mas eu vou arrastar seu cadáver comigo para as profundezas!"
             ],
             "player_kill": [
-                "Impossível! Um inseto não pode ferir um Deus Arcano!",
-                "Isso não é o fim... Minha alma retornará do próprio abismo!",
-                "Maldito humano! Aproveite sua sorte provisória!"
+                "Impossível! Um inseto não pode ferir uma anomalia cósmica!",
+                "Isso não é o fim... Minha consciência já migrou para a rede de cristal da torre!",
+                "Maldito primata! Aproveite os segundos residuais da sua sorte matemática!",
+                "Sua vitória é um bug na matriz do destino. Eu serei o patch de execução brutal!",
+                "Destruiu minha projeção astral? Irrelevante. Nos veremos no plano etéreo!",
+                "Você não mata energia arcana, seu troglodita, você apenas sofre as consequências da dissipação!",
+                "A carne apodrece, mas a frequência da minha alma sobrevive. Sua linhagem está marcada!",
+                "Comemore na lama e na sua própria ignorância. Eu ascenderei às estrelas!"
             ],
             "player_death": [
-                f"Sua alma agora me pertence! Destruído {event.get('reason', 'tentando me enfrentar')}!",
-                f"Você foi apagado da existência, como deveria ser. {event.get('reason', 'Morto em combate')}.",
-                f"Tão frágil... Sua poeira vai adubar meus jardins mágicos. {event.get('reason', 'Destruído')}!",
-                f"Você achou que a morte seria rápida? Seus gritos me divertem! {event.get('reason', 'Caído')}.",
-                f"Levante-se! Eu quero matar você de novo! Ah, esqueci, humanos só morrem uma vez. {event.get('reason', 'Patético')}.",
-                f"Isso foi... decepcionante. Eu esperava mais do que isso. {event.get('reason', 'Fim da linha')}.",
-                f"Nem mesmo o inferno vai aceitar uma alma tão insignificante quanto a sua. {event.get('reason', 'Adeus')}.",
-                f"Feitiçaria não é brincadeira para crianças! {event.get('reason', 'Queimado em cinzas')}."
+                f"Sua alma agora me pertence! {event.get('reason', 'Destruído por atrito cósmico')}!",
+                f"Você foi apagado da existência, reduzido a átomos inertes. {event.get('reason', 'Falha estrutural')}.",
+                f"Tão frágil... Sua poeira vai adubar a botânica dos meus jardins venenosos. {event.get('reason', 'Desintegrado')}!",
+                f"Você achou que o fim seria rápido? A relatividade distorcerá seus gritos por éons! {event.get('reason', 'Roto no espaço-tempo')}.",
+                f"Levante-se! Eu quero dissecar seu espírito de novo! Ah, sim, mortalidade linear. {event.get('reason', 'Patético')}.",
+                f"Isso foi deprimente. Eu calibrei feitiços de nono círculo para um saco de carne. {event.get('reason', 'Sobrecarga de mana')}.",
+                f"Nem mesmo as leis da conservação de massa vão se importar com você. {event.get('reason', 'Anulado')}.",
+                f"Manipulação da realidade não é brincadeira para primatas semi-evoluídos. {event.get('reason', 'Combustão espontânea')}!",
+                f"Seu processamento neural parou antes mesmo da minha magia te atingir. {event.get('reason', 'Morte por choque arcano')}."
             ],
             "player_idle": [
-                "Congelou de pavor? É a reação correta perante um lorde!",
-                "Aceite a morte parado. Pelo menos você morrerá de pé!",
-                "Seu cérebro parou de funcionar? Minha magia fará o resto!",
-                "Ande logo, verme! Eu não tenho milênios a perder com você!"
+                "Congelou de pavor existencial? É a reação neurológica correta perante um lorde!",
+                "Aceite a morte inerte. Simplifica os cálculos da minha detonação.",
+                "Seu cérebro atrofiou? O rigor mortis chegou antes do óbito?",
+                "Ande logo, verme! Eu não tenho decaimento radioativo de milênios a perder com você!",
+                "Meu feitiço de dilação temporal sequer foi ativado e você já é uma estátua geológica.",
+                "O fluxo de mana não espera sua letargia. Defenda-se ou torne-se adubo orgânico instantâneo!",
+                "Você respira por costume ou porque esqueceu como se para?",
+                "A pedra sob suas botas exibe mais agência e inteligência em combate do que você."
             ],
             "player_fleeing": [
-                "Fugir não vai curar suas feridas. O fogo arcano vai te encontrar!",
-                "Correr é inútil! Meus feitiços rasgam a trama do espaço!",
-                "Pode correr, verme! Eu amo caçar coisas fracas como você!",
-                "Dar as costas a um lorde da magia é implorar pela morte!",
-                "Vire-se e queime com honra, sua praga covarde!",
-                "Suas perninhas tremem de pavor cósmico?"
+                "Aceleração linear não te salva de geometria não-euclidiana, tolo!",
+                "Correr é inútil! Meus rastreadores de plasma mapeiam o medo no seu sistema nervoso!",
+                "Pode correr, verme! Cinética básica não supera o teletransporte quântico!",
+                "Dar as costas a um lorde da magia é encurtar o tempo de vida para a próxima fração de segundo!",
+                "Vai dar as costas para a entropia? Eu distorço o espaço até seus calcanhares!",
+                "Suas perninhas tremem sob a gravidade do seu próprio terror cósmico?",
+                "Fugir não reverte o decaimento celular que minhas maldições já iniciaram!",
+                "Sobrevivência não consta nas probabilidades que calculei para esta câmara!"
             ],
             "player_cornered": [
-                "Preso contra as pedras como o verme que você é!",
-                "Sinta o desespero! Não há como fugir da minha fúria arcanista!",
-                "O labirinto se fechou, e o Minotauro mágico chegou para jantar!"
+                "Preso contra as fundações como o rato insolente que você é!",
+                "A topologia do seu desespero agora é um sistema fechado. Saboreie a asfixia!",
+                "O labirinto de mana se estabilizou. Não há vetores de fuga para a sua massa corporal!",
+                "Fim da linha, macaco pelado. As paredes e eu concordamos que sua existência é redundante.",
+                "Encurralado. Hora de testar a resistência térmica do seu esqueleto ao fogo estelar.",
+                "Para onde agora? Você não possui eixos extras para escapar dessa dimensão!",
+                "Sinta a gravidade se fechar sobre você. O espaço tridimensional se tornou seu caixão!",
+                "Seus limites geométricos foram traçados em sangue. Prepare-se para a extração da alma."
             ]
         }
         
-        choices = taunts.get(event_type, ["Prepare-se para sofrer!", "Você é fraco!", "Sinta meu poder!"])
+        choices = taunts.get(event_type, ["O algoritmo da sua dor já está compilado!", "Falha anatômica iminente!", "Sinta o colapso absoluto!"])
         return random.choice(choices)
 
     def _generate_taunt(self, event):

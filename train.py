@@ -208,12 +208,15 @@ def heuristic_intent(obs, i):
 
 def _worker(remote, parent_remote, num_frames):
     parent_remote.close()
-    env = GameEngine(headless=True, num_frames=num_frames)
+    env = GameEngine(headless=True, num_frames=num_frames, is_training=True)
     try:
         while True:
             cmd, data = remote.recv()
             if cmd == 'step':
-                action, enemy_action, curriculum_progress = data
+                action, enemy_action, curriculum_progress, hp = data
+                env.player_hp_base = hp
+                env.enemy_hp_min = hp
+                env.enemy_hp_max = hp
                 obs, reward, done, _ = env.step(action, enemy_action=enemy_action, curriculum_progress=curriculum_progress)
                 ep_stats = None
                 if done:
@@ -221,7 +224,10 @@ def _worker(remote, parent_remote, num_frames):
                     obs = env.reset(curriculum_progress=curriculum_progress)
                 remote.send((obs, reward, done, ep_stats))
             elif cmd == 'reset':
-                curriculum_progress = data
+                curriculum_progress, hp = data
+                env.player_hp_base = hp
+                env.enemy_hp_min = hp
+                env.enemy_hp_max = hp
                 obs = env.reset(curriculum_progress=curriculum_progress)
                 remote.send(obs)
             elif cmd == 'get_state':
@@ -259,10 +265,10 @@ class VectorEnv:
         for remote in self.work_remotes:
             remote.close()
             
-    def step_async(self, actions_list, enemy_actions_list=None, curriculum_progress=0.0):
+    def step_async(self, actions_list, enemy_actions_list=None, curriculum_progress=0.0, hp=100.0):
         for i, remote in enumerate(self.remotes):
             ea = enemy_actions_list[i] if enemy_actions_list else None
-            remote.send(('step', (actions_list[i], ea, curriculum_progress)))
+            remote.send(('step', (actions_list[i], ea, curriculum_progress, hp)))
         self.waiting = True
 
     def step_wait(self):
@@ -271,13 +277,13 @@ class VectorEnv:
         obs_list, r_list, done_list, ep_stats_list = zip(*results)
         return self._stack_obs(obs_list), np.array(r_list), np.array(done_list), list(ep_stats_list)
 
-    def step(self, actions_list, enemy_actions_list=None, curriculum_progress=0.0):
-        self.step_async(actions_list, enemy_actions_list, curriculum_progress)
+    def step(self, actions_list, enemy_actions_list=None, curriculum_progress=0.0, hp=100.0):
+        self.step_async(actions_list, enemy_actions_list, curriculum_progress, hp)
         return self.step_wait()
 
-    def reset(self, curriculum_progress=0.0):
+    def reset(self, curriculum_progress=0.0, hp=100.0):
         for remote in self.remotes:
-            remote.send(('reset', curriculum_progress))
+            remote.send(('reset', (curriculum_progress, hp)))
         obs_list = [remote.recv() for remote in self.remotes]
         return self._stack_obs(obs_list)
 
@@ -306,14 +312,19 @@ class VectorEnv:
     def close(self):
         if self.closed:
             return
-        if self.waiting:
+        try:
+            if self.waiting:
+                for remote in self.remotes:
+                    if remote.poll():
+                        remote.recv()
             for remote in self.remotes:
-                remote.recv()
-        for remote in self.remotes:
-            remote.send(('close', None))
-        for p in self.ps:
-            p.join()
-        self.closed = True
+                remote.send(('close', None))
+        except (EOFError, OSError):
+            pass
+        finally:
+            for p in self.ps:
+                p.join(timeout=1.0)
+            self.closed = True
 
     def _stack_obs(self, obs_list):
         return {
@@ -565,6 +576,7 @@ def run_training_loop(epochs=100000):
     ewc_anchor = state.params
     ewc_fisher = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), state.params)
     ewc_lambda = 0.0
+    ewc_reset_selfplay = False
     
     opp_params = state.params
     
@@ -577,10 +589,20 @@ def run_training_loop(epochs=100000):
     history_v_mean = []
     history_progress = []
     live_renderer = None
+    last_opp_update_epoch = 0
     
     try:
         for epoch in range(1, epochs + 1):
             start_t = time.time()
+            
+            # --- INTERVENÇÕES DE SELF-PLAY ---
+            chance_self_play = max(0.0, min(1.0, (curriculum_progress - 0.80) / 0.20))
+            if chance_self_play > 0.5 and not ewc_reset_selfplay:
+                ewc_lambda = 0.05
+                ewc_fisher = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), state.params)
+                ewc_anchor = state.params
+                ewc_reset_selfplay = True
+                print("\n>>> [EWC] Limiar de Self-Play crítico atingido! EWC reiniciado (Fisher zerado) para adaptação livre.\n")
             
             supervisionar = os.path.exists("ver.txt")
             if supervisionar and live_renderer is None:
@@ -604,6 +626,11 @@ def run_training_loop(epochs=100000):
                 scalar = jnp.array(obs["scalar_obs"])
                 mask = jnp.array(obs["action_mask"])
                 
+                # Dynamic HP for Self-Play
+                current_hp = 100.0
+                if chance_self_play > 0.0:
+                    current_hp = max(100.0, 300.0 - (epoch // 10))
+                
                 rng, subkey = jax.random.split(rng)
                 actions_dict, val, log_prob = act_and_explore(state.params, spatial, scalar, mask, subkey, is_training=True)
                 
@@ -617,7 +644,7 @@ def run_training_loop(epochs=100000):
                     env_actions.append(act)
                 
                 enemy_actions = None
-                if curriculum_progress >= 0.95:  # Self-play no final do currículo
+                if np.random.rand() < chance_self_play:  # Soft Self-Play progressivo
                     dice = np.random.rand()
                     use_ia = False
                     curr_opp_params = opp_params
@@ -662,7 +689,13 @@ def run_training_loop(epochs=100000):
                         e_mask = np.ones((num_envs, 5), dtype=bool)
                         
                         rng, subkey2 = jax.random.split(rng)
-                        e_act_dict, _, _ = act_and_explore(curr_opp_params, jnp.array(e_spatial), jnp.array(e_scalar), jnp.array(e_mask), subkey2, is_training=False)
+                        
+                        # --- INTERVENÇÃO 3: Ruído Térmico (Epsilon-Greedy no Self-Play) ---
+                        if np.random.rand() < 0.05:
+                            e_act_dict, _, _ = act_and_explore(curr_opp_params, jnp.array(e_spatial), jnp.array(e_scalar), jnp.array(e_mask), subkey2, is_training=True)
+                        else:
+                            e_act_dict, _, _ = act_and_explore(curr_opp_params, jnp.array(e_spatial), jnp.array(e_scalar), jnp.array(e_mask), subkey2, is_training=False)
+                            
                         for i in range(num_envs):
                             e_act = {
                                 "move_idx": int(e_act_dict["move_idx"][i]),
@@ -671,7 +704,7 @@ def run_training_loop(epochs=100000):
                             }
                             enemy_actions.append(e_act)
                 
-                next_obs, reward, done, ep_stats_list = env.step(env_actions, enemy_actions_list=enemy_actions, curriculum_progress=curriculum_progress)
+                next_obs, reward, done, ep_stats_list = env.step(env_actions, enemy_actions_list=enemy_actions, curriculum_progress=curriculum_progress, hp=current_hp)
                 
                 # Coleta stats de episódios finalizados
                 for ep_stat in ep_stats_list:
@@ -835,12 +868,17 @@ def run_training_loop(epochs=100000):
             history_accuracy.append(float(accuracy))
             
             # Atualização Controlada do Oponente (Self-Play)
-            if curriculum_progress >= 0.95:
-                if sr >= 60.0:
+            if chance_self_play > 0.0:
+                if sr >= 60.0 and (epoch - last_opp_update_epoch) >= 50:
                     print(f"  [Self-Play] Agente dominou o oponente (Win Rate: {sr:.1f}% >= 60%). Atualizando oponente!")
                     opp_params = state.params
+                    historical_params_pool.append(state.params)
+                    if len(historical_params_pool) > 10:
+                        historical_params_pool.pop(0)
+                    last_opp_update_epoch = epoch
             else:
                 opp_params = state.params
+                last_opp_update_epoch = epoch
             
             if epoch % 10 == 0 or epoch == 1:
                 cur_alpha = 0.01  # Fixo

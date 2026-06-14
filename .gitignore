@@ -23,6 +23,7 @@ training_metrics.csv
 training_metrics_1.png
 training_metrics_2.png
 treinos_antigos/
+treinos_antigos_2/
 
 # OS
 .DS_Store
@@ -33,3 +34,4 @@ Thumbs.db
 
 # Temporary files
 ver.txt
+.env.example
