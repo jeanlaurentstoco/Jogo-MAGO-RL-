@@ -1,6 +1,7 @@
 import numpy as np
 import heapq
 import queue
+import collections
 
 class GameEngine:
     def __init__(self, map_size=64, max_projectiles=128, headless=True, num_frames=16, is_training=False):
@@ -421,6 +422,8 @@ class GameEngine:
                     if x < amin or x >= amax or y < amin or y >= amax:
                         self.map_walls[x, y] = 1
 
+        self._generate_wall_distance_field()
+
     def get_spatial_obs(self):
         spatial = np.zeros((self.map_size, self.map_size, 5), dtype=np.float32)
         spatial[:, :, 0] = self.map_walls
@@ -451,10 +454,14 @@ class GameEngine:
         
         to_enemy = self.enemy_pos - self.player_pos
         norm = np.linalg.norm(to_enemy)
-        if norm > 0:
+        
+        # Behavior Cloning de Mira Otimizado: 
+        # Zera a "mira ideal" se não houver visão (LOS) para evitar que a 
+        # rede neural seja punida por não mirar através das paredes.
+        if norm > 0 and self.check_los():
             ideal_aim = to_enemy / norm
         else:
-            ideal_aim = np.array([0.0, 1.0], dtype=np.float32)
+            ideal_aim = np.array([0.0, 0.0], dtype=np.float32)
             
         new_scalar = np.concatenate([self.player_stats, self.enemy_stats, ideal_aim]).astype(np.float32)
         self.scalar_buffer[:-1, :] = self.scalar_buffer[1:, :]
@@ -500,9 +507,11 @@ class GameEngine:
             "shoot": True,  # Sempre disponível
         }
 
-    def check_los(self):
-        x0, y0 = int(self.player_pos[0]), int(self.player_pos[1])
-        x1, y1 = int(self.enemy_pos[0]), int(self.enemy_pos[1])
+    def check_los(self, start=None, end=None):
+        if start is None: start = self.player_pos
+        if end is None: end = self.enemy_pos
+        x0, y0 = int(start[0]), int(start[1])
+        x1, y1 = int(end[0]), int(end[1])
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         x, y = x0, y0
@@ -528,6 +537,61 @@ class GameEngine:
                     err += dy
                 y += sy
         return True
+
+    def compute_true_distance(self, start, end):
+        """Calcula a menor distância navegável (BFS ignorando projéteis)."""
+        if self.check_los(start, end):
+            return np.linalg.norm(np.array(start) - np.array(end))
+            
+        start_int = (int(start[0]), int(start[1]))
+        end_int = (int(end[0]), int(end[1]))
+        
+        if self.map_walls[end_int[0], end_int[1]] or self.map_walls[start_int[0], start_int[1]]:
+            return np.inf
+            
+        queue = collections.deque([(start_int, 0)])
+        visited = set([start_int])
+        
+        dirs = [(0,1), (1,0), (0,-1), (-1,0), (1,1), (-1,-1), (1,-1), (-1,1)]
+        
+        while queue:
+            current, dist = queue.popleft()
+            if current == end_int:
+                return dist
+                
+            cx, cy = current
+            for dx, dy in dirs:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < self.map_size and 0 <= ny < self.map_size:
+                    if not self.map_walls[nx, ny] and (nx, ny) not in visited:
+                        visited.add((nx, ny))
+                        move_cost = 1.414 if dx != 0 and dy != 0 else 1.0
+                        queue.append(((nx, ny), dist + move_cost))
+                        
+        return np.inf
+
+    def _generate_wall_distance_field(self):
+        """Gera um field O(1) de distâncias para a parede mais próxima."""
+        self.wall_dist_map = np.full((self.map_size, self.map_size), np.inf, dtype=np.float32)
+        queue = collections.deque()
+        
+        walls_x, walls_y = np.where(self.map_walls == 1)
+        for x, y in zip(walls_x, walls_y):
+            queue.append(((x, y), 0.0))
+            self.wall_dist_map[x, y] = 0.0
+            
+        dirs = [(0,1), (1,0), (0,-1), (-1,0), (1,1), (-1,-1), (1,-1), (-1,1)]
+        
+        while queue:
+            (cx, cy), dist = queue.popleft()
+            for dx, dy in dirs:
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < self.map_size and 0 <= ny < self.map_size:
+                    move_cost = 1.414 if dx != 0 and dy != 0 else 1.0
+                    new_dist = dist + move_cost
+                    if new_dist < self.wall_dist_map[nx, ny]:
+                        self.wall_dist_map[nx, ny] = new_dist
+                        queue.append(((nx, ny), new_dist))
 
     def compute_pathfinding(self, start, end):
         """A* Algorithm modificado utilizando Cost Map para bot heurístico."""
@@ -675,6 +739,27 @@ class GameEngine:
                 step_reward -= camp_penalty
                 self.reward_from_penalties -= camp_penalty
                 
+        # 3. Penalidade de Ameaça (Esquiva/Dodging)
+        active = self.proj_active
+        enemy_projs = np.where(active & (self.proj_owner == 1))[0]
+        for i in enemy_projs:
+            proj_pos = self.proj_pos[i]
+            proj_vel = self.proj_vel[i]
+            vec_to_player = self.player_pos - proj_pos
+            dist = np.linalg.norm(vec_to_player)
+            
+            if dist < 15.0 and dist > 0.1:
+                vec_to_player_norm = vec_to_player / dist
+                proj_vel_norm = proj_vel / (np.linalg.norm(proj_vel) + 1e-8)
+                alignment = np.dot(proj_vel_norm, vec_to_player_norm)
+                
+                # Se o tiro está indo na direção do player (alinhamento > 0.85)
+                # Aplicamos um sangramento. O agente desvia andando para o lado para quebrar o alinhamento!
+                if alignment > 0.85:
+                    threat_penalty = (alignment - 0.85) * (15.0 - dist) * 0.005
+                    step_reward -= threat_penalty
+                    self.reward_from_penalties -= threat_penalty
+                    
         self.tick += 1
         
         
@@ -711,15 +796,17 @@ class GameEngine:
         rewards = np.zeros(self.num_intents, dtype=np.float32)
         
         # --- MÉTRICAS COMPUTADAS UMA VEZ ---
-        dist_to_enemy = np.linalg.norm(self.player_pos - self.enemy_pos)
+        dist_to_enemy = self.compute_true_distance(self.player_pos, self.enemy_pos)
         arena_min, arena_max = self.get_arena_bounds()
         arena_center = (arena_min + arena_max) / 2.0
-        dist_to_center = np.linalg.norm(self.player_pos - np.array([arena_center, arena_center]))
+        dist_to_center = self.compute_true_distance(self.player_pos, np.array([arena_center, arena_center]))
         
         px, py = self.player_pos
         ex, ey = self.enemy_pos
-        player_wall_dist = min(px - arena_min, arena_max - px, py - arena_min, arena_max - py)
-        enemy_wall_dist = min(ex - arena_min, arena_max - ex, ey - arena_min, arena_max - ey)
+        
+        # Distância real para a parede do BSP (Field O(1))
+        player_wall_dist = self.wall_dist_map[int(px), int(py)]
+        enemy_wall_dist = self.wall_dist_map[int(ex), int(ey)]
         
         p_hp = self.player_stats[0]
         e_hp = self.enemy_stats[0]
@@ -853,9 +940,12 @@ class GameEngine:
         
         # Buscar HP drops durante fuga
         drop_positions = np.argwhere(self.map_drops == 1)
+        closest_drop_dist = np.inf
         if len(drop_positions) > 0:
-            dists_to_drops = np.linalg.norm(drop_positions - self.player_pos, axis=1)
-            closest_drop_dist = np.min(dists_to_drops)
+            for d_pos in drop_positions:
+                d_dist = self.compute_true_distance(self.player_pos, d_pos)
+                if d_dist < closest_drop_dist:
+                    closest_drop_dist = d_dist
             if closest_drop_dist < 5.0:
                 rewards[3] += 0.15  # Perto de cura durante fuga
         
@@ -864,9 +954,13 @@ class GameEngine:
             rewards[3] -= 0.05
         
         # 4: ENCURRALAR — Empurrar inimigo contra parede/canto
-        if enemy_wall_dist < 8.0:
+        arena_size = arena_max - arena_min
+        wall_threshold = min(8.0, max(3.0, arena_size * 0.2))
+        corner_threshold = min(4.0, max(1.5, arena_size * 0.1))
+        
+        if enemy_wall_dist < wall_threshold:
             rewards[4] = 0.15  # Inimigo perto da parede, bom
-            if enemy_wall_dist < 4.0:
+            if enemy_wall_dist < corner_threshold:
                 rewards[4] = 0.25  # Inimigo no canto, excelente
         else:
             rewards[4] = -0.05  # Inimigo longe das paredes
@@ -887,13 +981,24 @@ class GameEngine:
         
         # 5: CONTROLAR_MAPA — Posição central, patrulhar, coletar drops
         arena_half = (arena_max - arena_min) / 2.0
-        if dist_to_center < arena_half * 0.3:
-            rewards[5] = 0.10  # No centro, controle territorial
-        elif dist_to_center < arena_half * 0.5:
-            rewards[5] = 0.05  # Razoavelmente central
-        else:
-            rewards[5] = -0.05  # Nas bordas
         
+        # Penalizar fortemente se ficar parado no centro (camp_penalty não é suficiente)
+        is_camping = hasattr(self, 'camp_time') and getattr(self, 'camp_time', 0) > 60
+        
+        if is_camping:
+            rewards[5] = -0.10  # Não pode acampar no centro!
+        else:
+            if dist_to_center < arena_half * 0.3:
+                rewards[5] = 0.05  # No centro, controle territorial (reduzido de 0.10 para evitar farm)
+            elif dist_to_center < arena_half * 0.5:
+                rewards[5] = 0.02  # Razoavelmente central
+            else:
+                rewards[5] = -0.05  # Nas bordas
+        
+        # Recompensar movimentação e evasão em controle de mapa
+        if player_wall_dist > 3.0 and dist_delta < 0.1: # Posição aberta e não correndo de medo
+            rewards[5] += 0.05
+            
         # Coletar drops quando em controle de mapa
         if len(drop_positions) > 0:
             if closest_drop_dist < 8.0:
@@ -1026,11 +1131,12 @@ class GameEngine:
         if self.shot_this_tick:
             to_enemy = self.enemy_pos - self.player_pos
             dist = np.linalg.norm(to_enemy)
-            if dist > 0:
+            if dist > 0 and self.check_los():
                 to_enemy_norm = to_enemy / dist
                 cos_theta = np.dot(aim_vec, to_enemy_norm)
-                aim_bonus = 0.1 * max(0.0, cos_theta)
-                reward += aim_bonus  # Bônus proporcional à precisão do disparo
+                # Bônus aumentado para justificar o risco do tiro e miss penalty
+                aim_bonus = 0.4 * max(0.0, cos_theta)
+                reward += aim_bonus
                 self.reward_from_aim_bonus += aim_bonus
                 
         # --- ATUALIZAÇÃO DE PROJÉTEIS ---
@@ -1051,7 +1157,7 @@ class GameEngine:
                 if player_misses > 0:
                     self.consecutive_hits = 0
                     self.player_hit_streak = 0
-                    miss_penalty = 0.3 * player_misses
+                    miss_penalty = 0.15 * player_misses
                     reward -= miss_penalty
                     self.reward_from_penalties -= miss_penalty
                 self.proj_active[idx_border] = False
@@ -1081,7 +1187,7 @@ class GameEngine:
                     player_wall_misses = np.sum(self.proj_owner[idx_hit] == 0)
                     if player_wall_misses > 0:
                         self.consecutive_hits = 0
-                        wall_miss_penalty = 0.3 * player_wall_misses
+                        wall_miss_penalty = 0.15 * player_wall_misses
                         reward -= wall_miss_penalty
                         self.reward_from_penalties -= wall_miss_penalty
                     self.proj_active[idx_hit] = False
@@ -1111,7 +1217,7 @@ class GameEngine:
                 player_bounce_misses = np.sum(self.proj_owner[idx_too_many] == 0)
                 if player_bounce_misses > 0:
                     self.consecutive_hits = 0
-                    bounce_miss_penalty = 0.3 * player_bounce_misses
+                    bounce_miss_penalty = 0.15 * player_bounce_misses
                     reward -= bounce_miss_penalty
                     self.reward_from_penalties -= bounce_miss_penalty
                 self.proj_active[idx_too_many] = False
