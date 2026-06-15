@@ -1107,12 +1107,11 @@ class GameEngine:
                 self.has_rotated_aim = True
         self.last_aim_vec = aim_vec.copy()
         
-        # Tiros do Jogador (cada disparo custa -0.05 para punir spray-and-pray)
-        if action.get("shoot") and self.proj_cooldown == 0:
+        # Disparo Automático
+        if self.proj_cooldown == 0:
             self.shots_fired += 1
             self.shot_this_tick = True
-            reward -= 0.05  # Custo de munição
-            self.reward_from_penalties -= 0.05
+            # Custo de munição removido, pois o disparo agora é automático
             inactive = np.where(~self.proj_active)[0]
             if len(inactive) > 0:
                 idx = inactive[0]
@@ -1157,9 +1156,11 @@ class GameEngine:
                 if player_misses > 0:
                     self.consecutive_hits = 0
                     self.player_hit_streak = 0
-                    miss_penalty = 0.15 * player_misses
-                    reward -= miss_penalty
-                    self.reward_from_penalties -= miss_penalty
+                    # Aplica miss_penalty APENAS se houver linha de visão para o inimigo (senão é fire de supressão)
+                    if self.check_los():
+                        miss_penalty = 0.15 * player_misses
+                        reward -= miss_penalty
+                        self.reward_from_penalties -= miss_penalty
                 self.proj_active[idx_border] = False
                 if enemy_misses > 0:
                     self.enemy_miss_streak += enemy_misses
@@ -1187,9 +1188,11 @@ class GameEngine:
                     player_wall_misses = np.sum(self.proj_owner[idx_hit] == 0)
                     if player_wall_misses > 0:
                         self.consecutive_hits = 0
-                        wall_miss_penalty = 0.15 * player_wall_misses
-                        reward -= wall_miss_penalty
-                        self.reward_from_penalties -= wall_miss_penalty
+                        # Aplica wall_miss_penalty APENAS se houver linha de visão
+                        if self.check_los():
+                            wall_miss_penalty = 0.15 * player_wall_misses
+                            reward -= wall_miss_penalty
+                            self.reward_from_penalties -= wall_miss_penalty
                     self.proj_active[idx_hit] = False
                 else:
                     # Ricochete realístico para colisões internas

@@ -133,20 +133,20 @@ class ActorCritic(nn.Module):
         if action_mask is not None:
             move_logits = jnp.where(action_mask, move_logits, -1e7)
             
-        shoot_logits = nn.Dense(2)(h)
-        
+        _dummy_shoot = nn.Dense(2)(h) # Mantido para não quebrar o checkpoint
+            
         aim_vec = nn.Dense(2)(h)
         aim_norm = aim_vec / (jnp.linalg.norm(aim_vec, axis=-1, keepdims=True) + 1e-8)
         
-        value = nn.Dense(1)(h)
+        v = nn.Dense(1)(h)
+        intent_logits = nn.Dense(6, name='intent_head')(h)
         
-        logits_dict = {
+        return {
             "move": move_logits,
-            "shoot": shoot_logits,
-            "aim": aim_norm
+            "aim": aim_norm,
+            "intent": intent_logits,
+            "value": jnp.squeeze(v, axis=-1)
         }
-        
-        return logits_dict, value
 
 # =============================================
 # DICIONÁRIO DE INTENÇÕES TÁTICAS — FSM de 6 estados
@@ -379,7 +379,7 @@ def create_train_state(rng, model, loaded_params=None):
 @jax.jit(static_argnames=['is_training'])
 def act_and_explore(params, spatial, scalar, mask, key, is_training=True):
     model = ActorCritic()
-    logits, value = model.apply(params, spatial, scalar, mask)
+    logits = model.apply(params, spatial, scalar, mask)
     
     keys = jax.random.split(key, 3)
     
@@ -392,18 +392,13 @@ def act_and_explore(params, spatial, scalar, mask, key, is_training=True):
         )
         log_prob = jax.nn.log_softmax(l)[jnp.arange(l.shape[0]), action]
         return action, log_prob
-
+    
     actions = {}
-    log_probs = {}
-    
-    actions["move_idx"], log_probs["move"] = sample_categorical(logits["move"], keys[0])
-    actions["shoot"], log_probs["shoot"] = sample_categorical(logits["shoot"], keys[1])
-    
+    actions["move"], log_prob_move = sample_categorical(logits["move"], keys[0])
     actions["aim"] = logits["aim"]
+    actions["intent"] = logits["intent"]
     
-    total_log_prob = log_probs["move"] + log_probs["shoot"]
-    
-    return actions, value[:, 0], total_log_prob
+    return actions, logits["value"], log_prob_move
 
 
 def safe_masked_entropy(logits, mask):
@@ -418,17 +413,16 @@ def train_step(state, batch_spatial, batch_scalar, batch_mask, batch_actions, ba
     
     ENT_COEF = 0.01
     
+    def get_log_prob(logits_batch, actions_batch):
+        return jnp.sum(jax.nn.one_hot(actions_batch, logits_batch.shape[-1]) * jax.nn.log_softmax(logits_batch), axis=-1)
+
     def loss_fn(params):
-        logits_dict, values = state.apply_fn(params, batch_spatial, batch_scalar, batch_mask)
-        values = jnp.squeeze(values)
+        logits_dict = state.apply_fn(params, batch_spatial, batch_scalar, batch_mask)
+        values = logits_dict["value"]
         
-        def get_log_prob(logits, action_idx):
-            return jax.nn.log_softmax(logits)[jnp.arange(logits.shape[0]), action_idx]
-            
         lp_move = get_log_prob(logits_dict["move"], batch_actions[:, 0])
-        lp_shoot = get_log_prob(logits_dict["shoot"], batch_actions[:, 1])
         
-        new_logprobs = lp_move + lp_shoot
+        new_logprobs = lp_move
         
         ratio = jnp.exp(new_logprobs - batch_old_logprobs)
         clip_adv = jnp.clip(ratio, 1.0 - 0.2, 1.0 + 0.2) * batch_advantages
@@ -436,20 +430,12 @@ def train_step(state, batch_spatial, batch_scalar, batch_mask, batch_actions, ba
         
         value_loss = 0.5 * jnp.mean((batch_returns - values) ** 2)
         
-        entropy = 0.0
-        for key in ["move", "shoot"]:
-            if key == "move":
-                ent = safe_masked_entropy(logits_dict[key], batch_mask)
-                entropy += jnp.mean(ent)
-            else:
-                logp = jax.nn.log_softmax(logits_dict[key], axis=-1)
-                p = jax.nn.softmax(logits_dict[key], axis=-1)
-                entropy += -jnp.mean(jnp.sum(p * logp, axis=-1))
+        entropy = jnp.mean(safe_masked_entropy(logits_dict["move"], batch_mask))
                 
         # Auxiliary loss para mira supervisionada (Behavior Cloning)
-        # scalar_obs tem shape (Batch, Time, 15). Os últimos 2 elementos são o ideal_aim (13:15)
         batch_optimal_aim = batch_scalar[:, -1, 13:15]
-        aim_loss = jnp.mean((logits_dict["aim"] - batch_optimal_aim) ** 2)
+        aim_mask = jnp.where(jnp.sum(jnp.abs(batch_optimal_aim), axis=-1, keepdims=True) > 0.001, 1.0, 0.0)
+        aim_loss = jnp.mean(aim_mask * (logits_dict["aim"] - batch_optimal_aim) ** 2)
             
         ewc_loss_leaves = jax.tree_util.tree_map(
             lambda p, a, f: jnp.sum(f * (p - a)**2),
@@ -463,7 +449,6 @@ def train_step(state, batch_spatial, batch_scalar, batch_mask, batch_actions, ba
     (loss, (pi_loss, v_loss, ent)), grads = grad_fn(state.params)
     state = state.apply_gradients(grads=grads)
     
-    # Atualiza Média Móvel da Matriz Fisher (EMA) com o quadrado dos gradientes (Aproximação Diagonal)
     new_fisher = jax.tree_util.tree_map(lambda f, g: 0.99 * f + 0.01 * (g ** 2), ewc_fisher, grads)
     
     return state, loss, pi_loss, v_loss, ent, new_fisher
@@ -504,7 +489,6 @@ def load_and_grow_checkpoint(filepath, model, rng, dummy_spatial, dummy_scalar, 
             else:
                 if k in source:
                     old_v = source[k]
-                    # Numpy convert to handle JAX arrays
                     v_np = np.array(v)
                     old_v_np = np.array(old_v)
                     
@@ -524,8 +508,8 @@ def load_and_grow_checkpoint(filepath, model, rng, dummy_spatial, dummy_scalar, 
                                     new_v[:, t:t+1, :] = old_v_np
                             target[k] = jnp.array(new_v)
                         else:
-                            print(f"  [Aviso] Shape mismatch não tratado em {path}/{k}")
-                            target[k] = jnp.array(old_v_np)
+                            print(f"  [Aviso] Shape mismatch não tratado em {path}/{k}. Inicialização aleatória mantida.")
+                            # NÃO faz target[k] = jnp.array(old_v_np) para não quebrar a rede!
                             
     recursive_update(new_params, old_params)
     print(f"Cirurgia concluída com sucesso!")
@@ -576,7 +560,7 @@ def run_training_loop(epochs=100000):
         state = create_train_state(rng, model)
     
     num_envs = 8
-    steps_per_epoch = 128 # 8 * 128 = 1024 passos totais por epoch (reduzido para caber na VRAM)
+    steps_per_epoch = 128
     env = VectorEnv(num_envs=num_envs)
     
     print("=====================================================")
@@ -585,7 +569,6 @@ def run_training_loop(epochs=100000):
     print("DICA: Pressione Ctrl+C para interromper o treinamento a qualquer momento!")
     print("=====================================================\n")
     
-    # curriculum_progress inicializado no bloco de carregamento acima
     historical_params_pool = []
     
     obs = env.reset(curriculum_progress=curriculum_progress)
@@ -612,7 +595,6 @@ def run_training_loop(epochs=100000):
         for epoch in range(1, epochs + 1):
             start_t = time.time()
             
-            # --- INTERVENÇÕES DE SELF-PLAY ---
             chance_self_play = max(0.0, min(1.0, (curriculum_progress - 0.80) / 0.20))
             if chance_self_play > 0.5 and not ewc_reset_selfplay:
                 ewc_lambda = 0.05
@@ -632,10 +614,9 @@ def run_training_loop(epochs=100000):
             
             spatial_list, scalar_list, mask_list = [], [], []
             actions_list, logprob_list, reward_list, value_list, done_list = [], [], [], [], []
-            epoch_episode_stats = []  # Acumula stats de episódios finalizados nesta epoch
+            epoch_episode_stats = []
             
             for _ in range(steps_per_epoch):
-                # --- INTENÇÃO TÁTICA HEURÍSTICA ---
                 intents = [heuristic_intent(obs, i) for i in range(num_envs)]
                 env.set_intent(intents)
                 
@@ -643,7 +624,6 @@ def run_training_loop(epochs=100000):
                 scalar = jnp.array(obs["scalar_obs"])
                 mask = jnp.array(obs["action_mask"])
                 
-                # Dynamic HP for Self-Play
                 current_hp = 100.0
                 if chance_self_play > 0.0:
                     current_hp = max(100.0, 300.0 - (epoch // 10))
@@ -654,60 +634,46 @@ def run_training_loop(epochs=100000):
                 env_actions = []
                 for i in range(num_envs):
                     act = {
-                        "move_idx": int(actions_dict["move_idx"][i]),
-                        "shoot": bool(actions_dict["shoot"][i]),
-                        "aim": np.array(actions_dict["aim"][i])
+                        "move_idx": int(actions_dict["move"][i]),
+                        "aim": np.array(actions_dict["aim"][i]),
+                        "intent": np.array(jax.nn.softmax(actions_dict["intent"][i]))
                     }
                     env_actions.append(act)
                 
                 enemy_actions = None
-                if np.random.rand() < chance_self_play:  # Soft Self-Play progressivo
+                if np.random.rand() < chance_self_play:
                     dice = np.random.rand()
                     use_ia = False
                     curr_opp_params = opp_params
                     
                     if dice < 0.5:
-                        pass # 50% de chance: IA heuristica das fases antigas (enemy_actions = None)
+                        pass
                     elif dice < 0.75:
-                        # 25% de chance: Oponente do passado
                         curr_opp_params = random.choice(historical_params_pool) if len(historical_params_pool) > 0 else opp_params
                         use_ia = True
                     else:
-                        # 25% de chance: Oponente mais recente
                         use_ia = True
                         
                     if use_ia:
                         enemy_actions = []
                         e_spatial = obs["spatial_obs"].copy()
-                    
-                        # Inverte perspectiva nos ultimos frames (indices 2 e 3 de cada bloco de 5)
-                        # spatial_obs é (Batch, 64, 64, 80)
                         for frame_idx in range(NUM_FRAMES):
                             start_idx = frame_idx * CHANNELS_PER_FRAME
                             temp = e_spatial[:, :, :, start_idx + 2].copy()
                             e_spatial[:, :, :, start_idx + 2] = e_spatial[:, :, :, start_idx + 3]
                             e_spatial[:, :, :, start_idx + 3] = temp
-                            
-                        # Constrói os atributos escalares na perspectiva do inimigo (tamanho 15)
-                        # Modelo espera: 10 (agente) + 3 (oponente) + 2 (aim PINN)
                         pad_enemy = np.zeros((num_envs, 10), dtype=np.float32)
                         pad_enemy[:, :3] = obs["enemy_stats"][:, :3]
-                        
                         e_opp_stats = obs["player_stats"][:, :3]
-                        
                         to_player = obs["player_pos"] - obs["enemy_pos"]
                         norms_e = np.linalg.norm(to_player, axis=1, keepdims=True)
                         norms_safe = np.where(norms_e > 0, norms_e, 1.0)
                         enemy_aim = np.where(norms_e > 0, to_player / norms_safe, np.array([[0.0, 1.0]], dtype=np.float32))
-                        
                         e_scalar = np.concatenate([pad_enemy, e_opp_stats, enemy_aim], axis=1).astype(np.float32)
-                        # Broadcast no tempo
                         e_scalar = np.repeat(e_scalar[:, None, :], NUM_FRAMES, axis=1) 
                         e_mask = np.ones((num_envs, 5), dtype=bool)
                         
                         rng, subkey2 = jax.random.split(rng)
-                        
-                        # --- INTERVENÇÃO 3: Ruído Térmico (Epsilon-Greedy no Self-Play) ---
                         if np.random.rand() < 0.05:
                             e_act_dict, _, _ = act_and_explore(curr_opp_params, jnp.array(e_spatial), jnp.array(e_scalar), jnp.array(e_mask), subkey2, is_training=True)
                         else:
@@ -715,15 +681,14 @@ def run_training_loop(epochs=100000):
                             
                         for i in range(num_envs):
                             e_act = {
-                                "move_idx": int(e_act_dict["move_idx"][i]),
-                                "shoot": bool(e_act_dict["shoot"][i]),
-                                "aim": np.array(e_act_dict["aim"][i])
+                                "move_idx": int(e_act_dict["move"][i]),
+                                "aim": np.array(e_act_dict["aim"][i]),
+                                "intent": np.array(jax.nn.softmax(e_act_dict["intent"][i]))
                             }
                             enemy_actions.append(e_act)
                 
                 next_obs, reward, done, ep_stats_list = env.step(env_actions, enemy_actions_list=enemy_actions, curriculum_progress=curriculum_progress, hp=current_hp)
                 
-                # Coleta stats de episódios finalizados
                 for ep_stat in ep_stats_list:
                     if ep_stat is not None:
                         epoch_episode_stats.append(ep_stat)
@@ -746,7 +711,7 @@ def run_training_loop(epochs=100000):
                 mask_list.append(obs["action_mask"])
                 
                 act_arr = np.stack([
-                    actions_dict["move_idx"], actions_dict["shoot"]
+                    actions_dict["move"], np.zeros_like(actions_dict["move"]) # np.zeros_like dummy para manter shape de storage
                 ], axis=1)
                 
                 actions_list.append(act_arr)
