@@ -28,45 +28,46 @@ class GameEngine:
             self.enemy_hp_max = 300.0
             self.player_hp_base = 300.0
         else:
-            self.enemy_hp_min = 30.0        # Em progress=0.0
-            self.enemy_hp_max = 100.0       # Em progress=1.0
-            self.player_hp_base = 100.0
+            self.enemy_hp_min = 300.0       # Em progress=0.0
+            self.enemy_hp_max = 200.0       # Em progress=1.0
+            self.player_hp_base = 200.0
             
         # Velocidade do Inimigo: parado → rápido (Igual ao player em p=1.0)
-        self.enemy_speed_min = 0.0
-        self.enemy_speed_max = 0.5
+        self.enemy_speed_min = 0.15
+        self.enemy_speed_max = 0.6
         
         # Velocidade dos Projéteis do Inimigo (Igual ao player em p=1.0)
-        self.enemy_proj_speed_min = 0.5
+        self.enemy_proj_speed_min = 0.8
         self.enemy_proj_speed_max = 1.5
         
         # Intervalo de Tiro do Inimigo: lento → rápido (Igual ao player em p=1.0)
-        self.enemy_shoot_interval_min = 40
+        self.enemy_shoot_interval_min = 10
         self.enemy_shoot_interval_max = 3
         
         # Hitbox do Inimigo: colossal → realista (Igual ao player em p=1.0)
-        self.hitbox_radius_max = 12.0
-        self.hitbox_radius_min = 1.0 
+        self.hitbox_radius_max = 6
+        self.hitbox_radius_min = 1.0
         
         # --- ARENA DINÂMICA (Jaula de Vidro) ---
         # A observação NUNCA muda de shape. A arena jogável cresce.
-        self.arena_size_min = 28        # Arena reduzida (~28x28 central)
+        self.arena_size_min = 60        # Arena expandida no início para dar espaço de desvio
         self.arena_size_max = self.map_size - 2  # Arena total (62x62 dentro das bordas)
         
         # --- LIMIARES DE DESBLOQUEIO (Threshold Masking) ---
-        self.threshold_movement = 0.1   # Movimento liberado
-        self.threshold_bounce = 0.6     # Ricochete de projéteis ativado
-        self.threshold_maze_walls = 0.45  # Paredes internas aparecem
+        self.threshold_movement = 0.00   # Movimento liberado
+        self.threshold_bounce = 0.40     # Ricochete de projéteis ativado
+        self.threshold_maze_walls = 0.20  # Paredes internas aparecem
         
         # --- LIMIARES DE IA INIMIGA ---
-        self.threshold_enemy_ai = 0.15    # Inimigo começa a se mover
-        self.threshold_enemy_shoot = 0.25 # Inimigo começa a atirar
-        self.threshold_enemy_astar = 0.8  # Inimigo usa A* pathfinding
+        self.threshold_enemy_ai = 0.00    # Inimigo começa a se mover
+        self.threshold_enemy_shoot = 0.00 # Inimigo começa a atirar
+        self.threshold_enemy_astar = 0.65  # Inimigo usa A* pathfinding
         
-        # --- SISTEMA DE INTENÇÕES TÁTICAS ---
-        self.num_intents = 11
+        # --- SISTEMA DE INTENÇÕES TÁTICAS (FSM de 6 estados) ---
+        # 0: ATACAR, 1: EXECUTAR, 2: DEFENDER, 3: FUGIR, 4: ENCURRALAR, 5: CONTROLAR_MAPA
+        self.num_intents = 6
         self.current_intent = np.zeros(self.num_intents, dtype=np.float32)
-        self.intent_scale = 1.5  # Multiplicador global das recompensas táticas (triplicado para forçar o aprendizado)
+        self.intent_scale = 5.0  # Multiplicador global inflacionado para sobrepujar a recompensa de combate bruto
         self.event_queue = queue.Queue()  # Fila thread-safe para eventos de gameplay
         
         self.reset()
@@ -232,36 +233,76 @@ class GameEngine:
         if amax - amin < 4:
             amax = amin + 4
             
-        p = self.curriculum_progress
+        # Spawn totalmente aleatório, mas garantindo que nasçam longe um do outro
+        # Exigência: devem nascer a pelo menos 70% da extensão da arena de distância.
+        min_dist = (amax - amin) * 0.7
         
-        if p < 0.1:
-            # Início: inimigo no centro, player aleatório (mas dentro da arena)
-            center = self.map_size // 2
-            self.enemy_pos = np.array([center, center], dtype=np.float32)
-            while True:
-                rx = np.random.randint(amin, amax)
-                ry = np.random.randint(amin, amax)
-                if np.linalg.norm(np.array([rx, ry]) - self.enemy_pos) >= 3.0:
-                    self.player_pos = np.array([rx, ry], dtype=np.float32)
-                    break
+        attempts = 0
+        while True:
+            px = np.random.randint(amin, amax)
+            py = np.random.randint(amin, amax)
+            ex = np.random.randint(amin, amax)
+            ey = np.random.randint(amin, amax)
+            attempts += 1
+            
+            # Se tentou muitas vezes e não achou, reduz a exigência de distância para não travar
+            if attempts > 100:
+                min_dist *= 0.9
+                attempts = 0
+                
+            if np.linalg.norm(np.array([px, py]) - np.array([ex, ey])) >= min_dist:
+                self.player_pos = np.array([px, py], dtype=np.float32)
+                self.enemy_pos = np.array([ex, ey], dtype=np.float32)
+                break
+
+    def _bsp_split(self, x, y, w, h, depth, max_depth, rooms):
+        """Divide recursivamente o espaço em sub-retângulos via BSP.
+        
+        Args:
+            x, y: Canto superior esquerdo da partição
+            w, h: Largura e altura da partição
+            depth: Profundidade atual da recursão
+            max_depth: Profundidade máxima (controla número de cômodos)
+            rooms: Lista para acumular os cômodos gerados
+        """
+        MIN_ROOM_SIZE = 8  # Tamanho mínimo de um cômodo
+        
+        if depth >= max_depth or w < MIN_ROOM_SIZE * 2 or h < MIN_ROOM_SIZE * 2:
+            # Folha: cria um cômodo com margem interna
+            margin = 1
+            room_x = x + margin
+            room_y = y + margin
+            room_w = max(MIN_ROOM_SIZE - 2, w - margin * 2)
+            room_h = max(MIN_ROOM_SIZE - 2, h - margin * 2)
+            rooms.append((room_x, room_y, room_w, room_h))
+            return
+        
+        # Decide se divide horizontal ou vertical
+        if w > h:
+            split_vertical = True
+        elif h > w:
+            split_vertical = False
         else:
-            # Spawn aleatório com distância mínima, dentro da arena
-            min_dist = min(5.0, (amax - amin) * 0.4)
-            attempts = 0
-            while True:
-                px = np.random.randint(amin, amax)
-                py = np.random.randint(amin, amax)
-                ex = np.random.randint(amin, amax)
-                ey = np.random.randint(amin, amax)
-                attempts += 1
-                if np.linalg.norm(np.array([px, py]) - np.array([ex, ey])) >= min_dist or attempts > 100:
-                    self.player_pos = np.array([px, py], dtype=np.float32)
-                    self.enemy_pos = np.array([ex, ey], dtype=np.float32)
-                    break
+            split_vertical = np.random.rand() > 0.5
+        
+        if split_vertical:
+            # Divide verticalmente (ao longo de X)
+            split = np.random.randint(MIN_ROOM_SIZE, max(MIN_ROOM_SIZE + 1, w - MIN_ROOM_SIZE))
+            self._bsp_split(x, y, split, h, depth + 1, max_depth, rooms)
+            self._bsp_split(x + split, y, w - split, h, depth + 1, max_depth, rooms)
+        else:
+            # Divide horizontalmente (ao longo de Y)
+            split = np.random.randint(MIN_ROOM_SIZE, max(MIN_ROOM_SIZE + 1, h - MIN_ROOM_SIZE))
+            self._bsp_split(x, y, w, split, depth + 1, max_depth, rooms)
+            self._bsp_split(x, y + split, w, h - split, depth + 1, max_depth, rooms)
 
     def generate_walls(self):
-        """Gera paredes. Bordas do grid são sempre paredes.
-        Paredes da arena virtual e paredes internas dependem do curriculum_progress.
+        """Gera paredes usando BSP (Binary Space Partitioning).
+        
+        Cria cômodos reais conectados por corredores em vez de blocos aleatórios.
+        A complexidade escala com curriculum_progress:
+        - progress < 0.20: Arena aberta sem paredes internas
+        - progress 0.20-1.0: Cômodos BSP aparecem gradualmente (2-3 níveis de profundidade)
         """
         self.map_walls = np.zeros((self.map_size, self.map_size), dtype=np.int32)
         
@@ -272,7 +313,6 @@ class GameEngine:
         self.map_walls[:, -1] = 1
         
         # Paredes da Arena Virtual (Jaula de Vidro)
-        # Tudo fora da arena é parede invisível
         arena_min, arena_max = self.get_arena_bounds()
         amin, amax = int(np.floor(arena_min)), int(np.ceil(arena_max))
         
@@ -282,30 +322,104 @@ class GameEngine:
                 if x < amin or x >= amax or y < amin or y >= amax:
                     self.map_walls[x, y] = 1
         
-        # Paredes internas (labirinto) — aparecem gradualmente após threshold
+        # Cômodos BSP — aparecem gradualmente após threshold
         p = self.curriculum_progress
         if p > self.threshold_maze_walls:
-            # Densidade cresce de 0% a 10% entre threshold_maze_walls e 1.0
             maze_t = (p - self.threshold_maze_walls) / (1.0 - self.threshold_maze_walls)
-            wall_density = maze_t * 0.1
-            num_walls = int((amax - amin) ** 2 * wall_density)
             
-            if num_walls > 0:
-                xs = np.random.randint(amin, amax, num_walls)
-                ys = np.random.randint(amin, amax, num_walls)
-                self.map_walls[xs, ys] = 1
+            # Profundidade BSP: 1 nível (2 salas) a 3 níveis (4-6 salas)
+            bsp_depth = max(1, int(maze_t * 3))
             
-            # Limpar área ao redor do spawn de player e inimigo
+            # Área jogável
+            arena_w = amax - amin
+            arena_h = amax - amin
+            
+            # Gera cômodos via BSP
+            rooms = []
+            self._bsp_split(amin, amin, arena_w, arena_h, 0, bsp_depth, rooms)
+            
+            if len(rooms) >= 2:
+                # Passo 1: Preenche a arena inteira com parede
+                self.map_walls[amin:amax, amin:amax] = 1
+                
+                # Passo 2: Escava cada cômodo (interior aberto)
+                for (rx, ry, rw, rh) in rooms:
+                    x1 = max(amin, rx)
+                    y1 = max(amin, ry)
+                    x2 = min(amax, rx + rw)
+                    y2 = min(amax, ry + rh)
+                    if x2 > x1 and y2 > y1:
+                        self.map_walls[x1:x2, y1:y2] = 0
+                
+                # Passo 3: Conecta cômodos adjacentes com corredores de 3 blocos
+                for i in range(len(rooms) - 1):
+                    r1 = rooms[i]
+                    r2 = rooms[i + 1]
+                    # Centro de cada cômodo
+                    cx1 = r1[0] + r1[2] // 2
+                    cy1 = r1[1] + r1[3] // 2
+                    cx2 = r2[0] + r2[2] // 2
+                    cy2 = r2[1] + r2[3] // 2
+                    
+                    # Corredor em L: horizontal depois vertical
+                    corridor_width = 3
+                    half_w = corridor_width // 2
+                    
+                    # Segmento horizontal
+                    x_start = min(cx1, cx2)
+                    x_end = max(cx1, cx2) + 1
+                    for dy in range(-half_w, half_w + 1):
+                        y_cor = np.clip(cy1 + dy, amin, amax - 1)
+                        self.map_walls[x_start:x_end, y_cor] = 0
+                    
+                    # Segmento vertical
+                    y_start = min(cy1, cy2)
+                    y_end = max(cy1, cy2) + 1
+                    for dx in range(-half_w, half_w + 1):
+                        x_cor = np.clip(cx2 + dx, amin, amax - 1)
+                        self.map_walls[x_cor, y_start:y_end] = 0
+                
+                # Também conectar o último ao primeiro para garantir circularidade
+                if len(rooms) > 2:
+                    r1 = rooms[-1]
+                    r2 = rooms[0]
+                    cx1 = r1[0] + r1[2] // 2
+                    cy1 = r1[1] + r1[3] // 2
+                    cx2 = r2[0] + r2[2] // 2
+                    cy2 = r2[1] + r2[3] // 2
+                    corridor_width = 3
+                    half_w = corridor_width // 2
+                    x_start = min(cx1, cx2)
+                    x_end = max(cx1, cx2) + 1
+                    for dy in range(-half_w, half_w + 1):
+                        y_cor = np.clip(cy1 + dy, amin, amax - 1)
+                        self.map_walls[x_start:x_end, y_cor] = 0
+                    y_start = min(cy1, cy2)
+                    y_end = max(cy1, cy2) + 1
+                    for dx in range(-half_w, half_w + 1):
+                        x_cor = np.clip(cx2 + dx, amin, amax - 1)
+                        self.map_walls[x_cor, y_start:y_end] = 0
+            
+            # Limpar área ao redor do spawn (raio 5) para garantir jogabilidade
             px, py = int(self.player_pos[0]), int(self.player_pos[1])
             ex, ey = int(self.enemy_pos[0]), int(self.enemy_pos[1])
-            self.map_walls[max(0, px-3):px+4, max(0, py-3):py+4] = 0
-            self.map_walls[max(0, ex-3):ex+4, max(0, ey-3):ey+4] = 0
+            spawn_radius = 5
+            self.map_walls[max(amin, px-spawn_radius):min(amax, px+spawn_radius+1), 
+                          max(amin, py-spawn_radius):min(amax, py+spawn_radius+1)] = 0
+            self.map_walls[max(amin, ex-spawn_radius):min(amax, ex+spawn_radius+1), 
+                          max(amin, ey-spawn_radius):min(amax, ey+spawn_radius+1)] = 0
             
             # Restaurar bordas externas (podem ter sido limpas)
             self.map_walls[0, :] = 1
             self.map_walls[-1, :] = 1
             self.map_walls[:, 0] = 1
             self.map_walls[:, -1] = 1
+            
+            # Restaurar paredes fora da arena
+            for x in range(self.map_size):
+                for y in range(self.map_size):
+                    if x < amin or x >= amax or y < amin or y >= amax:
+                        self.map_walls[x, y] = 1
 
     def get_spatial_obs(self):
         spatial = np.zeros((self.map_size, self.map_size, 5), dtype=np.float32)
@@ -511,7 +625,7 @@ class GameEngine:
             "proj_type": self.proj_type.copy(),
             "proj_owner": self.proj_owner.copy(),
             "curriculum_progress": self.curriculum_progress,
-            "current_intent": self.current_intent.copy() if hasattr(self, 'current_intent') else np.zeros(11, dtype=np.float32)
+            "current_intent": self.current_intent.copy() if hasattr(self, 'current_intent') else np.zeros(6, dtype=np.float32)
         }
     
     def get_episode_stats(self):
@@ -553,7 +667,7 @@ class GameEngine:
         self.pos_history[-1] = self.player_pos.copy()
         
         # 2. Penalidade de Campismo (Inércia e Mode Collapse) — ativa gradualmente
-        if p > 0.2 and self.tick >= 20:
+        if self.tick >= 20:
             pos_historica = self.pos_history[0]
             # Mede distância Euclidiana para a posição de 20 ticks atrás
             if np.linalg.norm(self.player_pos - pos_historica) < 2.0:
@@ -578,34 +692,57 @@ class GameEngine:
         return step_reward
     
     def compute_intent_reward(self):
-        """Calcula recompensa tática baseada no vetor de intenção one-hot ativo.
+        """Calcula recompensa tática via FSM de 6 estados.
         
-        Retorna o produto escalar entre o vetor de recompensas individuais
-        e o vetor one-hot de intenção, isolando apenas a meta ativa.
+        Estados:
+            0: ATACAR      — Avançar, manter distância de tiro (8-15), atirar agressivamente
+            1: EXECUTAR    — All-in: perseguir até melee, não parar de atirar
+            2: DEFENDER    — Manter distância > 15, buscar cobertura, atirar quando seguro
+            3: FUGIR       — Maximizar distância, ignorar tiro, buscar HP drops
+            4: ENCURRALAR  — Posicionar para empurrar inimigo contra parede/canto
+            5: CONTROLAR_MAPA — Posição central, patrulhar, coletar drops
         """
         if not np.any(self.current_intent > 0):
             return 0.0
             
-        # O agente não pode receber recompensas ou punições de movimentação tática se ainda não tem permissão para andar
         if self.curriculum_progress < self.threshold_movement:
             return 0.0
         
         rewards = np.zeros(self.num_intents, dtype=np.float32)
         
+        # --- MÉTRICAS COMPUTADAS UMA VEZ ---
         dist_to_enemy = np.linalg.norm(self.player_pos - self.enemy_pos)
         arena_min, arena_max = self.get_arena_bounds()
+        arena_center = (arena_min + arena_max) / 2.0
+        dist_to_center = np.linalg.norm(self.player_pos - np.array([arena_center, arena_center]))
         
+        px, py = self.player_pos
+        ex, ey = self.enemy_pos
+        player_wall_dist = min(px - arena_min, arena_max - px, py - arena_min, arena_max - py)
+        enemy_wall_dist = min(ex - arena_min, arena_max - ex, ey - arena_min, arena_max - ey)
+        
+        p_hp = self.player_stats[0]
+        e_hp = self.enemy_stats[0]
+        p_hp_pct = p_hp / max(1.0, self.player_hp_base)
+        
+        has_los = self.check_los()
+        
+        # Deltas (requerem tick anterior)
         dist_delta = 0.0
         if self.prev_dist_to_enemy is not None:
             dist_delta = dist_to_enemy - self.prev_dist_to_enemy
-            
+        
+        wall_delta = 0.0
+        if self.prev_enemy_wall_dist is not None:
+            wall_delta = enemy_wall_dist - self.prev_enemy_wall_dist
+        
         # --- EVENTOS DE COMPORTAMENTO ---
         def _dispatch_event(ev_type, **kwargs):
             ev = {
                 "type": ev_type,
                 "tick": self.tick,
-                "player_hp": self.player_stats[0],
-                "enemy_hp": self.enemy_stats[0],
+                "player_hp": p_hp,
+                "enemy_hp": e_hp,
                 "distance": dist_to_enemy
             }
             ev.update(kwargs)
@@ -615,35 +752,33 @@ class GameEngine:
         # Jogador Parado
         if self.prev_move_dir is not None and np.linalg.norm(self.prev_move_dir) < 0.1:
             self.player_idle_ticks += 1
-            if self.player_idle_ticks == 60: # 1 segundo parado
+            if self.player_idle_ticks == 60:
                 _dispatch_event("player_idle")
         else:
             self.player_idle_ticks = 0
             
-        # Jogador Fugindo (Baseado na direção do input, ignorando paredes)
+        # Jogador Fugindo
         fleeing = False
         if self.prev_move_dir is not None and np.linalg.norm(self.prev_move_dir) > 0.1:
             to_enemy_dir = self.enemy_pos - self.player_pos
             norm_e = np.linalg.norm(to_enemy_dir)
             if norm_e > 0:
                 dot = np.dot(self.prev_move_dir, to_enemy_dir / norm_e)
-                if dot < -0.5: # Movimento "quase oposto" (ângulo maior que 120 graus) em relação ao inimigo
+                if dot < -0.5:
                     fleeing = True
 
         if fleeing:
             self.player_flee_ticks += 1
-            if self.player_flee_ticks == 30: # 0.5 segundo fugindo initerruptamente
+            if self.player_flee_ticks == 45:  # 1.5 segundo fugindo
                 self.death_reason = "tentando fugir das minhas chamas"
                 _dispatch_event("player_fleeing")
         else:
             self.player_flee_ticks = 0
             
         # Jogador Encurralado
-        px, py = self.player_pos
-        player_wall_dist = min(px - arena_min, arena_max - px, py - arena_min, arena_max - py)
         if player_wall_dist < 2.0 and dist_to_enemy < 8.0:
             self.player_cornered_ticks += 1
-            if self.player_cornered_ticks == 20: # ~0.3 segundos encurralado
+            if self.player_cornered_ticks == 30:  # 1 segundo encurralado
                 self.death_reason = "encurralado contra a parede implorando por piedade"
                 _dispatch_event("player_cornered")
         else:
@@ -652,117 +787,127 @@ class GameEngine:
         if self.player_flee_ticks == 0 and self.player_cornered_ticks == 0:
             self.death_reason = "em combate franco"
         
-        # Inimigo perseguindo A* ou Line-of-sight
-        pass # Only a comment separator in intent reward logic for now
-        arena_center = (arena_min + arena_max) / 2.0
-        dist_to_center = np.linalg.norm(self.player_pos - np.array([arena_center, arena_center]))
+        # =============================================
+        # FSM DE 6 ESTADOS — RECOMPENSAS ESPECÍFICAS
+        # =============================================
         
-        # Distância do inimigo à parede mais próxima
-        ex, ey = self.enemy_pos
-        enemy_wall_dist = min(ex - arena_min, arena_max - ex, ey - arena_min, arena_max - ey)
+        # 0: ATACAR — Avançar + manter distância ideal (8-15) + atirar
+        # Recompensa: reduzir distância até range ideal, atirar com LOS
+        if 8.0 <= dist_to_enemy <= 15.0:
+            rewards[0] = 0.15  # Na zona ideal de combate
+            if self.shot_this_tick and has_los:
+                rewards[0] += 0.10  # Bônus por atirar com visão clara
+        elif dist_to_enemy > 15.0:
+            # Precisa se aproximar
+            if dist_delta < -0.1:
+                rewards[0] = 0.10  # Aproximando, bom
+            else:
+                rewards[0] = -0.10  # Deveria estar aproximando
+        else:
+            # Muito perto (< 8), deveria recuar para range ideal
+            if dist_delta > 0.1:
+                rewards[0] = 0.05  # Recuando para range
+            else:
+                rewards[0] = -0.05  # Muito perto e não recua
         
-        # Delta de distância (requer tick anterior)
-        dist_delta = 0.0
-        if self.prev_dist_to_enemy is not None:
-            dist_delta = dist_to_enemy - self.prev_dist_to_enemy
-        
-        wall_delta = 0.0
-        if self.prev_enemy_wall_dist is not None:
-            wall_delta = enemy_wall_dist - self.prev_enemy_wall_dist
-        
-        # 0: AGRESSIVO_PERSEGUIR — recompensa redução de distância, penaliza distanciamento
+        # 1: EXECUTAR — All-in: perseguir implacavelmente + atirar sem parar
         if dist_delta < -0.1:
-            rewards[0] = 0.1
+            rewards[1] = 0.20  # Fechando distância
         elif dist_delta > 0.1:
-            rewards[0] = -0.1
-        
-        # 1: FLANQUEAR — recompensa estar fora do cone de mira inimigo, penaliza movimento frontal/inércia
-        to_player = self.player_pos - self.enemy_pos
-        to_player_norm = np.linalg.norm(to_player)
-        if to_player_norm > 0:
-            to_player_dir = to_player / to_player_norm
-            if self.prev_move_dir is not None:
-                move_norm = np.linalg.norm(self.prev_move_dir)
-                if move_norm > 0:
-                    lateral = abs(np.cross(to_player_dir, self.prev_move_dir / move_norm))
-                    if lateral > 0.5:
-                        rewards[1] = 0.1
-                    else:
-                        rewards[1] = -0.1
-        
-        # 2: FORCAR_CANTO — recompensa inimigo perto de parede, penaliza inimigo indo pro meio
-        if wall_delta < -0.1:
-            rewards[2] = 0.1
-        elif wall_delta > 0.1:
-            rewards[2] = -0.1
-        
-        # 3: ALL_IN_LETAL — recompensa por atirar com inimigo quase morto, penaliza hesitação
-        if self.enemy_stats[0] < 20:
-            if self.shot_this_tick:
-                rewards[3] = 0.5
-            else:
-                rewards[3] = -0.2  # Punição por não aproveitar a chance
+            rewards[1] = -0.15  # Recuando quando deveria executar
         else:
-            rewards[3] = -0.1 # Punição por ativar all-in com o inimigo com HP alto
-        
-        # 4: EVASIVO_RECUAR — recompensa aumento de distância, penaliza aproximação
-        if dist_delta > 0.1:
-            rewards[4] = 0.1
-        elif dist_delta < -0.1:
-            rewards[4] = -0.1
-        
-        # 5: BUSCAR_COBERTURA — recompensa LOS bloqueado, penaliza ficar em campo aberto
-        if not self.check_los():
-            rewards[5] = 0.1
-        else:
-            rewards[5] = -0.1
-        
-        # 6: MOVIMENTO_ERRATICO — recompensa mudança brusca de direção, penaliza inércia retilínea
-        if self.prev_move_dir is not None and self.last_aim_vec is not None:
-            if np.linalg.norm(self.prev_move_dir) > 0:
-                dot = np.dot(self.prev_move_dir, self.pos_history[-1] - self.pos_history[-2]) if self.tick > 2 else 0
-                if abs(dot) < 0.3:
-                    rewards[6] = 0.05
-                else:
-                    rewards[6] = -0.05
-        
-        # 7: SOBREVIVENCIA_TARTARUGA — penaliza atirar, recompensa sobreviver
+            rewards[1] = -0.05  # Parado
         if self.shot_this_tick:
-            rewards[7] = -0.1
+            rewards[1] += 0.15  # Atirar é obrigatório no all-in
         else:
-            rewards[7] = 0.05
+            rewards[1] -= 0.10  # Hesitação é punida
+        if dist_to_enemy < 5.0 and self.shot_this_tick:
+            rewards[1] += 0.20  # Bônus melee: atirar de perto
         
-        # 8: CONTROLE_TERRITORIAL — recompensa proximidade do centro, penaliza bordas
-        arena_half = (arena_max - arena_min) / 2.0
-        if dist_to_center < arena_half * 0.3:
-            rewards[8] = 0.05
+        # 2: DEFENDER — Manter distância > 15, buscar cobertura, atirar quando seguro
+        if dist_to_enemy > 15.0:
+            rewards[2] = 0.10  # Distância segura
+            if not has_los:
+                rewards[2] += 0.10  # Cobertura = excelente
+        elif dist_to_enemy < 10.0:
+            rewards[2] = -0.15  # Muito perto quando deveria defender
         else:
-            rewards[8] = -0.05
+            rewards[2] = 0.0  # Zona cinza
         
-        # 9: PATRULHA_PERIMETRAL — recompensa manter distância, penaliza oscilações grandes
-        if self.prev_dist_to_enemy is not None:
-            if abs(dist_delta) < 0.3 and dist_to_enemy > 10:
-                rewards[9] = 0.05
-            else:
-                rewards[9] = -0.05
+        if dist_delta > 0.1:
+            rewards[2] += 0.05  # Aumentando distância, bom para defesa
         
-        # 10: CAZAR_RECURSOS — recompensa proximidade a drops, penaliza desperdício de tempo
+        # Atirar defensivamente: só vale se tem LOS e distância segura
+        if self.shot_this_tick and has_los and dist_to_enemy > 12.0:
+            rewards[2] += 0.10  # Tiro seguro de longe
+        
+        # 3: FUGIR — Maximizar distância, ignorar combate, buscar HP drops
+        if dist_delta > 0.2:
+            rewards[3] = 0.20  # Fugindo efetivamente
+        elif dist_delta > 0.0:
+            rewards[3] = 0.05  # Fugindo devagar
+        elif dist_delta < -0.1:
+            rewards[3] = -0.20  # Aproximando quando deveria fugir
+        else:
+            rewards[3] = -0.10  # Parado quando deveria fugir
+        
+        # Buscar HP drops durante fuga
         drop_positions = np.argwhere(self.map_drops == 1)
         if len(drop_positions) > 0:
             dists_to_drops = np.linalg.norm(drop_positions - self.player_pos, axis=1)
             closest_drop_dist = np.min(dists_to_drops)
             if closest_drop_dist < 5.0:
-                rewards[10] = 0.2
-            else:
-                rewards[10] = -0.1
-        else:
-            rewards[10] = -0.1  # Ativou caçar com mapa limpo
+                rewards[3] += 0.15  # Perto de cura durante fuga
         
-        # Atualiza estado anterior para próximo tick
+        # Penaliza atirar durante fuga (desperdício de tempo)
+        if self.shot_this_tick:
+            rewards[3] -= 0.05
+        
+        # 4: ENCURRALAR — Empurrar inimigo contra parede/canto
+        if enemy_wall_dist < 8.0:
+            rewards[4] = 0.15  # Inimigo perto da parede, bom
+            if enemy_wall_dist < 4.0:
+                rewards[4] = 0.25  # Inimigo no canto, excelente
+        else:
+            rewards[4] = -0.05  # Inimigo longe das paredes
+        
+        # Recompensa por empurrar inimigo em direção à parede
+        if wall_delta < -0.1:
+            rewards[4] += 0.10  # Inimigo se aproximando da parede
+        elif wall_delta > 0.1:
+            rewards[4] -= 0.10  # Inimigo escapando do canto
+        
+        # Manter pressão: atirar enquanto encurrala
+        if self.shot_this_tick and enemy_wall_dist < 8.0:
+            rewards[4] += 0.10
+        
+        # Evitar que o jogador se encurrale no processo
+        if player_wall_dist < 3.0:
+            rewards[4] -= 0.10  # Se encurralar é ruim
+        
+        # 5: CONTROLAR_MAPA — Posição central, patrulhar, coletar drops
+        arena_half = (arena_max - arena_min) / 2.0
+        if dist_to_center < arena_half * 0.3:
+            rewards[5] = 0.10  # No centro, controle territorial
+        elif dist_to_center < arena_half * 0.5:
+            rewards[5] = 0.05  # Razoavelmente central
+        else:
+            rewards[5] = -0.05  # Nas bordas
+        
+        # Coletar drops quando em controle de mapa
+        if len(drop_positions) > 0:
+            if closest_drop_dist < 8.0:
+                rewards[5] += 0.10
+        
+        # Atirar quando oportuno (sem exigir posição específica)
+        if self.shot_this_tick and has_los:
+            rewards[5] += 0.05
+        
+        # --- Atualiza estado anterior ---
         self.prev_dist_to_enemy = dist_to_enemy
         self.prev_enemy_wall_dist = enemy_wall_dist
         
-        # Produto escalar: isola apenas a recompensa da intenção ativa
+        # Produto escalar: isola apenas a recompensa do estado ativo
         return float(np.dot(rewards, self.current_intent))
 
     def step(self, action, enemy_action=None, curriculum_progress=None):
@@ -1048,8 +1193,8 @@ class GameEngine:
                         self.consecutive_hits = hits
                     self.last_hit_tick = self.tick
                     
-                    base_penalty = hits * 1.0
-                    combo_penalty = (self.consecutive_hits - 1) * 0.2 if self.consecutive_hits > 1 else 0.0
+                    base_penalty = hits * 5.0
+                    combo_penalty = (self.consecutive_hits - 1) * 2.0 if self.consecutive_hits > 1 else 0.0
                     total_penalty = base_penalty + combo_penalty
                     
                     self.player_stats[0] -= hits * 10
@@ -1219,7 +1364,7 @@ class GameEngine:
             
         # Escala o tempo limite proporcionalmente à vida (para dar tempo de se matarem com 1000 HP)
         hp_multiplier = self.player_hp_base / 100.0
-        max_ticks = int(self.lerp(75, 1000, p) * hp_multiplier)
+        max_ticks = int(self.lerp(500, 1000, p) * hp_multiplier)
 
         if self.tick >= max_ticks:
             reward -= 50.0  # Penalidade de timeout extrema

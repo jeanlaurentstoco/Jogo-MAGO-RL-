@@ -132,15 +132,15 @@ class Renderer:
         px, py = state["player_pos"]
         ex, ey = state["enemy_pos"]
         
-        # Inimigo (hitbox dinâmica)
-        pygame.draw.circle(self.screen, COLOR_ENEMY, (int(ex * CELL_SIZE), int(ey * CELL_SIZE)), max(3, int(hitbox_radius * CELL_SIZE * 0.5)))
-        # Player
-        pygame.draw.circle(self.screen, COLOR_PLAYER, (int(px * CELL_SIZE), int(py * CELL_SIZE)), CELL_SIZE // 2)
+        # Inimigo (hitbox dinâmica reflete 100% da colisão real do engine)
+        pygame.draw.circle(self.screen, COLOR_ENEMY, (int(ex * CELL_SIZE), int(ey * CELL_SIZE)), max(3, int(hitbox_radius * CELL_SIZE)))
+        # Player (hitbox = 1.0)
+        pygame.draw.circle(self.screen, COLOR_PLAYER, (int(px * CELL_SIZE), int(py * CELL_SIZE)), int(1.0 * CELL_SIZE))
         
         # Escudo
         p_stats = state["player_stats"]
         if p_stats[1] > 0:
-            pygame.draw.circle(self.screen, COLOR_SHIELD, (int(px * CELL_SIZE), int(py * CELL_SIZE)), CELL_SIZE, 2)
+            pygame.draw.circle(self.screen, COLOR_SHIELD, (int(px * CELL_SIZE), int(py * CELL_SIZE)), int(1.2 * CELL_SIZE), 2)
             
         # 3. Desenhar Projéteis
         p_active = state["proj_active"]
@@ -170,20 +170,27 @@ class Renderer:
         self.screen.blit(enemy_hp_text, (WINDOW_SIZE - 180, 10))
         self.screen.blit(progress_text, (WINDOW_SIZE // 2 - 60, 10))
         
-        # Mostra o comando (Intent) do treinamento
+        # Mostra o estado tático FSM ativo
         intent_names = [
-            "Agressivo: Perseguir", "Flanquear: Esquerda", "Flanquear: Direita",
-            "All-In Letal", "Evasivo: Recuar", "Defensivo: Proteger",
-            "Movimento Errático", "Sobrevivência Tartaruga", "Controle Territorial",
-            "Patrulha Perimetral", "Caçar Recursos"
+            "⚔ Atacar", "💀 Executar", "🛡 Defender",
+            "🏃 Fugir", "📐 Encurralar", "🗺 Controlar Mapa"
+        ]
+        intent_colors = [
+            (255, 180, 50),   # Atacar: laranja
+            (255, 50, 50),    # Executar: vermelho
+            (100, 180, 255),  # Defender: azul
+            (50, 255, 50),    # Fugir: verde
+            (255, 100, 255),  # Encurralar: roxo
+            (200, 200, 200),  # Controlar Mapa: cinza
         ]
         intent_vec = state.get("current_intent")
         if intent_vec is not None and np.any(intent_vec):
             idx = int(np.argmax(intent_vec))
             if 0 <= idx < len(intent_names):
                 intent_name = intent_names[idx]
-                intent_text = self.font_small.render(f"Tática (Treino): {intent_name}", True, (255, 220, 100))
-                self.screen.blit(intent_text, (WINDOW_SIZE // 2 - 80, 28))
+                intent_color = intent_colors[idx]
+                intent_text = self.font_small.render(f"Tática: {intent_name}", True, intent_color)
+                self.screen.blit(intent_text, (WINDOW_SIZE // 2 - 60, 28))
         
         # Cooldowns (dividir por 30 para segundos)
         ui_y = 30
@@ -242,25 +249,31 @@ class Renderer:
         }
 
     def get_intent_from_state(self, state):
-        intent = np.zeros(11, dtype=np.float32)
+        """FSM heurística de 6 estados para gameplay."""
+        intent = np.zeros(6, dtype=np.float32)
         p_hp = state["player_stats"][0]
         e_hp = state["enemy_stats"][0]
         dist = np.linalg.norm(state["player_pos"] - state["enemy_pos"])
+        e_pos = state["enemy_pos"]
         
-        if e_hp <= 10: intent[3] = 1.0
-        elif p_hp < 30: intent[4] = 1.0
-        elif e_hp < 50 and dist > 15: intent[0] = 1.0
-        elif dist < 8: intent[6] = 1.0
-        elif dist > 30: intent[0] = 1.0
-        else: intent[8] = 1.0
-            
-        if p_hp > 50:
-            drop_positions = np.argwhere(state.get("drops", np.zeros((64, 64))) == 1) if "drops" in state else []
-            if len(drop_positions) > 0:
-                dists_to_drops = np.linalg.norm(drop_positions - state["player_pos"], axis=1)
-                if np.min(dists_to_drops) < 8.0:
-                    intent = np.zeros(11, dtype=np.float32)
-                    intent[10] = 1.0
+        p_hp_pct = p_hp / 200.0  # HP base = 200
+        e_hp_pct = e_hp / 200.0
+        enemy_wall_dist = min(e_pos[0], 64 - e_pos[0], e_pos[1], 64 - e_pos[1])
+        
+        # FSM com prioridade
+        if e_hp_pct <= 0.20:
+            intent[1] = 1.0  # EXECUTAR
+        elif p_hp_pct <= 0.40 and p_hp < e_hp:
+            intent[3] = 1.0  # FUGIR
+        elif enemy_wall_dist < 8.0 and p_hp >= e_hp:
+            intent[4] = 1.0  # ENCURRALAR
+        elif p_hp < e_hp and p_hp_pct > 0.40:
+            intent[2] = 1.0  # DEFENDER
+        elif p_hp_pct > 0.40 and 5.0 < dist < 25.0:
+            intent[0] = 1.0  # ATACAR
+        else:
+            intent[5] = 1.0  # CONTROLAR_MAPA
+        
         return intent
 
     def run(self):

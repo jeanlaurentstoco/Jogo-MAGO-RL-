@@ -149,60 +149,77 @@ class ActorCritic(nn.Module):
         return logits_dict, value
 
 # =============================================
-# DICIONÁRIO DE INTENÇÕES TÁTICAS (Heurístico para Treinamento)
+# DICIONÁRIO DE INTENÇÕES TÁTICAS — FSM de 6 estados
 # =============================================
 INTENT_NAMES = [
-    "AGRESSIVO_PERSEGUIR",    # 0
-    "FLANQUEAR",              # 1
-    "FORCAR_CANTO",           # 2
-    "ALL_IN_LETAL",           # 3
-    "EVASIVO_RECUAR",         # 4
-    "BUSCAR_COBERTURA",       # 5
-    "MOVIMENTO_ERRATICO",     # 6
-    "SOBREVIVENCIA_TARTARUGA",# 7
-    "CONTROLE_TERRITORIAL",   # 8
-    "PATRULHA_PERIMETRAL",    # 9
-    "CAZAR_RECURSOS",         # 10
+    "ATACAR",           # 0
+    "EXECUTAR",         # 1
+    "DEFENDER",         # 2
+    "FUGIR",            # 3
+    "ENCURRALAR",       # 4
+    "CONTROLAR_MAPA",   # 5
 ]
 
-def heuristic_intent(obs, i):
-    """Seleciona a intenção tática via regras heurísticas.
+def heuristic_intent(obs, i, hp_base=200.0):
+    """Seleciona a intenção tática via FSM de 6 estados.
+    
+    Estados (em ordem de prioridade):
+        1. EXECUTAR    — Inimigo com HP ≤ 20%
+        2. FUGIR       — Agente com HP ≤ 40% e em desvantagem
+        3. ENCURRALAR  — Inimigo perto da parede e temos mais HP
+        4. DEFENDER    — Menos HP que inimigo (mas não crítico)
+        5. ATACAR      — HP saudável, inimigo em range
+        6. CONTROLAR_MAPA — Default neutro
     
     Args:
         obs: Dict de observações do VectorEnv
         i: Índice do ambiente
+        hp_base: HP base para cálculo de percentual
     Returns:
-        Vetor one-hot de 11 dimensões
+        Vetor one-hot de 6 dimensões
     """
-    intent = np.zeros(11, dtype=np.float32)
+    intent = np.zeros(6, dtype=np.float32)
     
     p_hp = obs["player_stats"][i, 0]
     e_hp = obs["enemy_stats"][i, 0]
     dist = np.linalg.norm(obs["player_pos"][i] - obs["enemy_pos"][i])
+    e_pos_x, e_pos_y = obs["enemy_pos"][i]
     
-    # Lógica de prioridade: situações mais urgentes primeiro
-    if e_hp <= 10:                              # Inimigo a um tiro de morrer
-        intent[3] = 1.0   # ALL_IN_LETAL
-    elif p_hp < 30:                              # HP crítico
-        intent[4] = 1.0   # EVASIVO_RECUAR
-    elif e_hp < 50 and dist > 15:                # Inimigo ferido + longe
-        intent[0] = 1.0   # AGRESSIVO_PERSEGUIR
-    elif dist < 8:                               # Muito perto
-        intent[6] = 1.0   # MOVIMENTO_ERRATICO
-    elif dist > 30:                              # Muito longe
-        intent[0] = 1.0   # AGRESSIVO_PERSEGUIR
-    else:                                        # Neutro
-        intent[8] = 1.0   # CONTROLE_TERRITORIAL
+    # Percentuais de HP
+    p_hp_pct = p_hp / max(1.0, hp_base)
+    e_hp_pct = e_hp / max(1.0, hp_base)
     
-    # Overlay: se existem drops próximos e HP nao eh crítico
-    if p_hp > 50:
-        drop_positions = np.argwhere(obs.get("drops", np.zeros((64, 64))) == 1) if "drops" in obs else []
-        if len(drop_positions) > 0:
-            player_pos = obs["player_pos"][i]
-            dists_to_drops = np.linalg.norm(drop_positions - player_pos, axis=1)
-            if np.min(dists_to_drops) < 8.0:
-                intent = np.zeros(11, dtype=np.float32)
-                intent[10] = 1.0  # CAZAR_RECURSOS
+    # Distância do inimigo à parede mais próxima
+    enemy_wall_dist = min(e_pos_x, 64 - e_pos_x, e_pos_y, 64 - e_pos_y)
+    
+    # Projéteis ativos do inimigo (se disponível no obs)
+    enemy_projs = 0  # Não disponível no batch obs do VectorEnv
+    
+    # --- FSM de 6 estados com prioridade clara ---
+    
+    # 1. EXECUTAR: Inimigo a ponto de morrer (≤ 20% HP)
+    if e_hp_pct <= 0.20:
+        intent[1] = 1.0  # EXECUTAR
+    
+    # 2. FUGIR: Agente com HP ≤ 40% E em desvantagem
+    elif p_hp_pct <= 0.40 and p_hp < e_hp:
+        intent[3] = 1.0  # FUGIR
+    
+    # 3. ENCURRALAR: Inimigo perto da parede E temos mais HP
+    elif enemy_wall_dist < 8.0 and p_hp >= e_hp:
+        intent[4] = 1.0  # ENCURRALAR
+    
+    # 4. DEFENDER: Temos menos HP que o inimigo (mas não crítico)
+    elif p_hp < e_hp and p_hp_pct > 0.40:
+        intent[2] = 1.0  # DEFENDER
+    
+    # 5. ATACAR: HP saudável, inimigo em range de combate
+    elif p_hp_pct > 0.40 and 5.0 < dist < 25.0:
+        intent[0] = 1.0  # ATACAR
+    
+    # 6. Default: CONTROLAR_MAPA
+    else:
+        intent[5] = 1.0  # CONTROLAR_MAPA
     
     return intent
 
