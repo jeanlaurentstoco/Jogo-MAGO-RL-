@@ -96,7 +96,8 @@ class Renderer:
         arena_min, arena_max = self.engine.get_arena_bounds()
         
         # Hitbox visual exata ditada pela engine física
-        hitbox_radius = self.engine.lerp(self.engine.hitbox_radius_max, self.engine.hitbox_radius_min, progress)
+        p_hitbox = min(progress / 0.5, 1.0)
+        hitbox_radius = self.engine.lerp(self.engine.hitbox_radius_max, self.engine.hitbox_radius_min, p_hitbox)
         
         # 1. Desenhar Paredes, Drops e Arena
         walls = state["walls"]

@@ -46,7 +46,7 @@ class GameEngine:
         self.enemy_shoot_interval_max = 3
         
         # Hitbox do Inimigo: colossal → realista (Igual ao player em p=1.0)
-        self.hitbox_radius_max = 6
+        self.hitbox_radius_max = 12.0
         self.hitbox_radius_min = 1.0
         
         # --- ARENA DINÂMICA (Jaula de Vidro) ---
@@ -57,7 +57,7 @@ class GameEngine:
         # --- LIMIARES DE DESBLOQUEIO (Threshold Masking) ---
         self.threshold_movement = 0.00   # Movimento liberado
         self.threshold_bounce = 0.40     # Ricochete de projéteis ativado
-        self.threshold_maze_walls = 0.20  # Paredes internas aparecem
+        self.threshold_maze_walls = 0.50  # Paredes internas aparecem
         
         # --- LIMIARES DE IA INIMIGA ---
         self.threshold_enemy_ai = 0.00    # Inimigo começa a se mover
@@ -140,8 +140,11 @@ class GameEngine:
         self.reward_from_kills = 0.0
         self.reward_from_hits = 0.0
         self.reward_from_drops = 0.0
-        self.reward_from_aim_bonus = 0.0
-        self.reward_from_penalties = 0.0
+        self.reward_from_aim = 0.0
+        self.reward_from_intent = 0.0
+        
+        # Perfil de IA heurística aleatório para evitar sobreajuste (mode collapse)
+        self.enemy_profile = np.random.choice(['aggro', 'flee'])
         self.reward_from_intent = 0.0
         
         # --- Contadores de Anomalia (Event Queue) ---
@@ -400,6 +403,17 @@ class GameEngine:
                     for dx in range(-half_w, half_w + 1):
                         x_cor = np.clip(cx2 + dx, amin, amax - 1)
                         self.map_walls[x_cor, y_start:y_end] = 0
+                        
+                # Passo 4: Densidade progressiva das paredes internas
+                # maze_t (0.0 -> 1.0) controla a porcentagem de blocos sólidos
+                density = 0.1 + 0.9 * maze_t
+                wall_mask = np.random.rand(self.map_size, self.map_size) < density
+                
+                interior_mask = np.zeros((self.map_size, self.map_size), dtype=bool)
+                interior_mask[amin+1:amax-1, amin+1:amax-1] = True
+                
+                to_remove = (self.map_walls == 1) & interior_mask & ~wall_mask
+                self.map_walls[to_remove] = 0
             
             # Limpar área ao redor do spawn (raio 5) para garantir jogabilidade
             px, py = int(self.player_pos[0]), int(self.player_pos[1])
@@ -694,9 +708,13 @@ class GameEngine:
     
     def get_episode_stats(self):
         """Retorna estatísticas do episódio atual para instrumentação."""
-        accuracy = (self.shots_hit / max(1, self.shots_fired)) * 100.0
+        # Desconta os tiros que ainda estão voando no momento em que a partida acaba
+        active_player_projs = np.sum(self.proj_active & (self.proj_owner == 0))
+        effective_shots_fired = max(0, self.shots_fired - active_player_projs)
+        
+        accuracy = (self.shots_hit / max(1, effective_shots_fired)) * 100.0
         return {
-            "shots_fired": self.shots_fired,
+            "shots_fired": effective_shots_fired,
             "shots_hit": self.shots_hit,
             "accuracy": accuracy,
             "kill_tick": self.kill_tick,
@@ -1035,7 +1053,8 @@ class GameEngine:
         # =============================================
         # FÍSICA INTERPOLADA (LERP) — calculada a cada tick
         # =============================================
-        current_hitbox = self.lerp(self.hitbox_radius_max, self.hitbox_radius_min, p)
+        p_hitbox = min(p / 0.5, 1.0)
+        current_hitbox = self.lerp(self.hitbox_radius_max, self.hitbox_radius_min, p_hitbox)
         current_enemy_speed = self.lerp(self.enemy_speed_min, self.enemy_speed_max, p)
         current_enemy_proj_speed = self.lerp(self.enemy_proj_speed_min, self.enemy_proj_speed_max, p)
         current_shoot_interval = int(self.lerp(self.enemy_shoot_interval_min, self.enemy_shoot_interval_max, p))
@@ -1369,30 +1388,75 @@ class GameEngine:
                 if self.enemy_stats[1] > 0:
                     e_speed_actual *= 0.3
                     
-                if p >= self.threshold_enemy_astar and real_dist > 5:
-                    # A* pathfinding para inimigo avançado
-                    next_pos = self.compute_pathfinding(self.enemy_pos, self.player_pos)
-                    enemy_vec = next_pos - self.enemy_pos
-                    enemy_dist = np.linalg.norm(enemy_vec)
-                    if enemy_dist > 0:
-                        enemy_vec /= enemy_dist
+                profile = getattr(self, 'enemy_profile', 'aggro')
+                
+                if profile == 'flee':
+                    # Flee Inteligente com Pathfinding e Drible
+                    # Define um alvo distante a cada 30 ticks para manter consistência
+                    if not hasattr(self, 'flee_target') or self.tick % 30 == 0:
+                        best_dist = -1
+                        best_target = self.enemy_pos.copy()
+                        for _ in range(15): # Testa pontos aleatórios na arena
+                            rx = np.random.randint(arena_min, arena_max)
+                            ry = np.random.randint(arena_min, arena_max)
+                            if not self.map_walls[rx, ry]:
+                                d_to_player = np.linalg.norm(np.array([rx, ry]) - self.player_pos)
+                                if d_to_player > best_dist:
+                                    best_dist = d_to_player
+                                    best_target = np.array([rx, ry], dtype=np.float32)
+                        self.flee_target = best_target
                     
-                    new_ex = self.enemy_pos[0] + enemy_vec[0] * e_speed_actual
-                    if self.is_inside_arena(new_ex, self.enemy_pos[1]) and not self.map_walls[int(new_ex), int(self.enemy_pos[1])]:
-                        self.enemy_pos[0] = new_ex
-                    new_ey = self.enemy_pos[1] + enemy_vec[1] * e_speed_actual
-                    if self.is_inside_arena(self.enemy_pos[0], new_ey) and not self.map_walls[int(self.enemy_pos[0]), int(new_ey)]:
-                        self.enemy_pos[1] = new_ey
-                elif np.random.rand() < 0.2:
-                    # Random walk simples
-                    move_idx = np.random.randint(1, 5)
-                    move_vec_e = self.move_dirs[move_idx] * e_speed_actual
-                    new_ex = self.enemy_pos[0] + move_vec_e[0]
+                    next_pos = self.compute_pathfinding(self.enemy_pos, self.flee_target)
+                    flee_vec = next_pos - self.enemy_pos
+                    flee_dist = np.linalg.norm(flee_vec)
+                    if flee_dist > 0:
+                        flee_vec /= flee_dist
+                        
+                    # Drible de emergência se estiver muito perto do jogador (encurralado)
+                    if real_dist < 4.0:
+                        panic_vec = self.enemy_pos - self.player_pos
+                        panic_norm = np.linalg.norm(panic_vec)
+                        if panic_norm > 0:
+                            panic_vec /= panic_norm
+                        # Mistura o A* com o vetor de pânico para dar "olé"
+                        flee_vec = flee_vec * 0.3 + panic_vec * 0.7
+                        flee_norm = np.linalg.norm(flee_vec)
+                        if flee_norm > 0:
+                            flee_vec /= flee_norm
+
+                    new_ex = self.enemy_pos[0] + flee_vec[0] * e_speed_actual
                     if self.is_inside_arena(new_ex, self.enemy_pos[1]) and not self.map_walls[int(new_ex), int(self.enemy_pos[1])]:
                         self.enemy_pos[0] = np.clip(new_ex, arena_min, arena_max - 1)
-                    new_ey = self.enemy_pos[1] + move_vec_e[1]
+                    new_ey = self.enemy_pos[1] + flee_vec[1] * e_speed_actual
                     if self.is_inside_arena(self.enemy_pos[0], new_ey) and not self.map_walls[int(self.enemy_pos[0]), int(new_ey)]:
                         self.enemy_pos[1] = np.clip(new_ey, arena_min, arena_max - 1)
+                            
+                else:
+                    # 'aggro': Caça o jogador impiedosamente (A* + Random Walk)
+                    if p >= self.threshold_enemy_astar and real_dist > 5:
+                        # A* pathfinding para inimigo avançado
+                        next_pos = self.compute_pathfinding(self.enemy_pos, self.player_pos)
+                        enemy_vec = next_pos - self.enemy_pos
+                        enemy_dist = np.linalg.norm(enemy_vec)
+                        if enemy_dist > 0:
+                            enemy_vec /= enemy_dist
+                        
+                        new_ex = self.enemy_pos[0] + enemy_vec[0] * e_speed_actual
+                        if self.is_inside_arena(new_ex, self.enemy_pos[1]) and not self.map_walls[int(new_ex), int(self.enemy_pos[1])]:
+                            self.enemy_pos[0] = new_ex
+                        new_ey = self.enemy_pos[1] + enemy_vec[1] * e_speed_actual
+                        if self.is_inside_arena(self.enemy_pos[0], new_ey) and not self.map_walls[int(self.enemy_pos[0]), int(new_ey)]:
+                            self.enemy_pos[1] = new_ey
+                    elif np.random.rand() < 0.2:
+                        # Random walk simples
+                        move_idx = np.random.randint(1, 5)
+                        move_vec_e = self.move_dirs[move_idx] * e_speed_actual
+                        new_ex = self.enemy_pos[0] + move_vec_e[0]
+                        if self.is_inside_arena(new_ex, self.enemy_pos[1]) and not self.map_walls[int(new_ex), int(self.enemy_pos[1])]:
+                            self.enemy_pos[0] = np.clip(new_ex, arena_min, arena_max - 1)
+                        new_ey = self.enemy_pos[1] + move_vec_e[1]
+                        if self.is_inside_arena(self.enemy_pos[0], new_ey) and not self.map_walls[int(self.enemy_pos[0]), int(new_ey)]:
+                            self.enemy_pos[1] = np.clip(new_ey, arena_min, arena_max - 1)
             
             # Tiro do Inimigo — probabilidade escalada com progress
             if p >= self.threshold_enemy_shoot:

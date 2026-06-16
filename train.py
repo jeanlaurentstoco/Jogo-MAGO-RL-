@@ -4,6 +4,9 @@ os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.90"
 os.environ["TF_GPU_ALLOCATOR"] = "cuda_malloc_async"
 
 import multiprocessing as mp
+if mp.current_process().name != 'MainProcess':
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    
 try:
     mp.set_start_method("spawn")
 except RuntimeError:
@@ -558,6 +561,8 @@ def run_training_loop(epochs=100000):
     else:
         curriculum_progress = 0.0
         state = create_train_state(rng, model)
+        
+    curriculum_unlocked = (curriculum_progress > 0.0)
     
     num_envs = 8
     steps_per_epoch = 128
@@ -595,13 +600,9 @@ def run_training_loop(epochs=100000):
         for epoch in range(1, epochs + 1):
             start_t = time.time()
             
-            chance_self_play = max(0.0, min(1.0, (curriculum_progress - 0.80) / 0.20))
-            if chance_self_play > 0.5 and not ewc_reset_selfplay:
-                ewc_lambda = 0.05
-                ewc_fisher = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), state.params)
-                ewc_anchor = state.params
-                ewc_reset_selfplay = True
-                print("\n>>> [EWC] Limiar de Self-Play crítico atingido! EWC reiniciado (Fisher zerado) para adaptação livre.\n")
+            # chance_self_play = max(0.0, min(1.0, (curriculum_progress - 0.80) / 0.20))
+            chance_self_play = 1.0 # 100% Self-Play forçado
+            # O EWC não será mais zerado no Self-Play para evitar catastrophic forgetting das habilidades básicas (mira/navegação)
             
             supervisionar = os.path.exists("ver.txt")
             if supervisionar and live_renderer is None:
@@ -849,10 +850,15 @@ def run_training_loop(epochs=100000):
             history_sr.append(float(sr))
             history_accuracy.append(float(accuracy))
             
+            if accuracy >= 60.0:
+                curriculum_unlocked = True
+                
+            sr_avg100 = np.mean(history_sr[-100:]) if len(history_sr) > 0 else sr
+            
             # Atualização Controlada do Oponente (Self-Play)
             if chance_self_play > 0.0:
-                if sr >= 60.0 and (epoch - last_opp_update_epoch) >= 50:
-                    print(f"  [Self-Play] Agente dominou o oponente (Win Rate: {sr:.1f}% >= 60%). Atualizando oponente!")
+                if sr_avg100 >= 70.0 and (epoch - last_opp_update_epoch) >= 50:
+                    print(f"  [Self-Play] Agente dominou o oponente (Win Rate 100: {sr_avg100:.1f}% >= 70%). Atualizando oponente!")
                     opp_params = state.params
                     historical_params_pool.append(state.params)
                     if len(historical_params_pool) > 10:
@@ -867,7 +873,6 @@ def run_training_loop(epochs=100000):
                 
                 # Recompensa Média Suavizada (últimos 100 epochs)
                 r_avg100 = np.mean(history_rewards[-100:]) if len(history_rewards) > 0 else epoch_total_reward
-                sr_avg100 = np.mean(history_sr[-100:]) if len(history_sr) > 0 else sr
                 
                 print(f"[Epoch {epoch}/{epochs}] Progress:{curriculum_progress:.3f} | "
                       f"Loss:{loss:.2f} Pi:{pi_loss:.2f} Ent:{ent:.2f} α:{cur_alpha:.3f} | "
@@ -911,7 +916,7 @@ def run_training_loop(epochs=100000):
                 
                 # --- PROGRESSÃO CONTÍNUA DO CURRÍCULO ---
                 # Incrementa curriculum_progress em +0.005 quando recompensa média é positiva
-                if epoch_total_reward > 0 and curriculum_progress < 1.0:
+                if curriculum_unlocked and epoch_total_reward > 0 and curriculum_progress < 1.0:
                     old_progress = curriculum_progress
                     curriculum_progress = min(1.0, curriculum_progress + 0.005)
                     env.update_curriculum(0.005)
