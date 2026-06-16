@@ -140,7 +140,8 @@ class GameEngine:
         self.reward_from_kills = 0.0
         self.reward_from_hits = 0.0
         self.reward_from_drops = 0.0
-        self.reward_from_aim = 0.0
+        self.reward_from_aim_bonus = 0.0
+        self.reward_from_penalties = 0.0
         self.reward_from_intent = 0.0
         
         # Perfil de IA heurística aleatório para evitar sobreajuste (mode collapse)
