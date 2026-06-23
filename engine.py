@@ -1127,11 +1127,14 @@ class GameEngine:
                 self.has_rotated_aim = True
         self.last_aim_vec = aim_vec.copy()
         
-        # Disparo Automático
-        if self.proj_cooldown == 0:
+        # Disparo Automático (IA) ou Manual (Humano)
+        is_shooting = True
+        if action.get("human_playing", False):
+            is_shooting = action.get("shoot", False)
+            
+        if is_shooting and self.proj_cooldown == 0:
             self.shots_fired += 1
             self.shot_this_tick = True
-            # Custo de munição removido, pois o disparo agora é automático
             inactive = np.where(~self.proj_active)[0]
             if len(inactive) > 0:
                 idx = inactive[0]
@@ -1144,7 +1147,7 @@ class GameEngine:
                 elif self.player_stats[8] > 0: ptype = 3
                 self.proj_type[idx] = ptype
                 self.proj_owner[idx] = 0
-                self.proj_cooldown = 3
+                self.proj_cooldown = 20 if action.get("human_playing", False) else 3
                 
         # Bônus de Mira — aplicado APENAS no tick em que o agente dispara
         if self.shot_this_tick:
@@ -1461,15 +1464,24 @@ class GameEngine:
             
             # Tiro do Inimigo — probabilidade escalada com progress
             if p >= self.threshold_enemy_shoot:
-                # Probabilidade de tiro por tick baseada no intervalo interpolado
-                shoot_prob = 1.0 / max(1, current_shoot_interval)
-                if self.tick % max(1, current_shoot_interval) == 0 or np.random.rand() < shoot_prob * 0.1:
+                # Intervalos mais suaves para o inimigo não metralhar tanto
+                smooth_shoot_interval = int(self.lerp(30, 10, p))
+                shoot_prob = 1.0 / max(1, smooth_shoot_interval)
+                if self.tick % max(1, smooth_shoot_interval) == 0 or np.random.rand() < shoot_prob * 0.1:
                     inactive = np.where(~self.proj_active)[0]
                     if len(inactive) > 0:
                         idx = inactive[0]
                         self.proj_active[idx] = True
                         self.proj_pos[idx] = self.enemy_pos.copy()
-                        self.proj_vel[idx] = real_vec_norm * current_enemy_proj_speed
+                        
+                        # Adiciona imperfeição na mira que diminui conforme o progress avança
+                        noise_amount = (1.0 - p) * 0.5
+                        noise_vec = np.array([np.random.randn(), np.random.randn()]) * noise_amount
+                        noisy_aim = real_vec_norm + noise_vec
+                        n_norm = np.linalg.norm(noisy_aim)
+                        if n_norm > 0: noisy_aim /= n_norm
+                        
+                        self.proj_vel[idx] = noisy_aim * current_enemy_proj_speed
                         self.proj_bounces[idx] = 0
                         self.proj_type[idx] = 0
                         self.proj_owner[idx] = 1

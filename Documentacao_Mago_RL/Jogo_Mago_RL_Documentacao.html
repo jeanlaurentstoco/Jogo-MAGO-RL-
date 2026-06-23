@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Documentação Tensor Mage Arena</title>
+    <!-- Configuração do MathJax para renderizar as formulas LaTeX -->
+    <script>
+    MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']]
+      },
+      svg: {
+        fontCache: 'global'
+      }
+    };
+    </script>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            color: #333;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+            background-color: #f4f4f4;
+        }
+        .page {
+            width: 210mm;
+            min-height: 297mm;
+            padding: 20mm;
+            margin: 10mm auto;
+            border: 1px #D3D3D3 solid;
+            border-radius: 5px;
+            background: white;
+            box-shadow: 0 0 5px rgba(0, 0, 0, 0.1);
+        }
+        h1, h2, h3 {
+            color: #2c3e50;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 5px;
+        }
+        code {
+            background-color: #f8f9fa;
+            padding: 2px 4px;
+            border-radius: 4px;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        pre {
+            background-color: #272822;
+            color: #f8f8f2;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+        pre code {
+            background-color: transparent;
+            color: inherit;
+        }
+        @media print {
+            body, .page {
+                margin: 0;
+                border: initial;
+                border-radius: initial;
+                width: initial;
+                min-height: initial;
+                box-shadow: initial;
+                background: initial;
+                page-break-after: always;
+            }
+            .page {
+                padding: 1cm;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="page">
+        <h1>Documentação Completa: Tensor Mage Arena (Jogo-MAGO-RL)</h1>
+<h2>1. Introdução e Visão Geral</h2>
+<p>O projeto <strong>Tensor Mage Arena</strong> consiste em um ambiente de Aprendizado por Reforço (Reinforcement Learning - RL) desenhado para treinar um agente autônomo através de Self-Play contínuo. A arquitetura é construída sobre <strong>JAX</strong> e <strong>Flax</strong>, permitindo que a amostragem do ambiente e as atualizações de gradiente sejam massivamente paralelizadas em tensores, evitando gargalos de CPU e alocação de memória gráfica tradicional.</p>
+<p>O objetivo do projeto é que o agente aprenda heurísticas avançadas de combate — como navegação labiríntica, desvio de projéteis (dodging), perseguição, e otimização de tempo —, tudo através de sinais densos de recompensa (<em>Reward Shaping</em>) e um sistema avançado de progressão suave (<em>Continuous Curriculum Learning</em>).</p>
+<hr />
+<h2>2. A Engine de Simulação (State Space e Action Space)</h2>
+<p>A classe <code>GameEngine</code> atua como o <strong>Markov Decision Process (MDP)</strong>. Diferente de jogos PyGame comuns, ela foi escrita puramente em operações vetoriais de Numpy para rodar em modo <code>headless</code> durante o treinamento, garantindo amostragens ultra-rápidas.</p>
+<h3>2.1. Espaço de Observações (State Space) $\mathcal{S}$</h3>
+<p>A rede neural não recebe uma "foto" estática, mas uma fusão de dados espaciais e escalares ao longo do tempo (Frame Stacking) para inferir velocidades e direções (resolvendo o problema de estado oculto em MDPs).
+O estado $S_t$ no tempo $t$ é definido como:</p>
+<ul>
+<li><strong>Spatial Observation (Visão Matricial):</strong> Um tensor de formato <code>(64, 64, 40)</code>. São $8$ frames empilhados temporalmente, onde cada frame possui $5$ canais de informação matricial (Paredes, Drops, Posição do Agente, Posição do Inimigo, Densidade de Projéteis Ativos).</li>
+<li><strong>Scalar Observation (Sensores Numéricos):</strong> Um tensor <code>(8, 15)</code>. Contém o Histórico HP, cooldowns, timers, e o vetor unitário de mira ideal supervisionada $\vec{v}_{aim}$.</li>
+</ul>
+<h3>2.2. Espaço de Ações (Action Space) $\mathcal{A}$</h3>
+<p>O agente opera num domínio multi-modal (Múltiplas cabeças de saída):
+- <strong>Movimentação (Discreta):</strong> Distância de Manhattan em 5 direções $[Norte, Sul, Leste, Oeste, Parado]$.
+- <strong>Mira (Contínua):</strong> Vetor normalizado no espaço $L_2$, definido por $\vec{u} = \frac{(x, y)}{\sqrt{x^2 + y^2} + \epsilon}$.
+- <strong>Intenção Tática (Discreta - Auxiliar):</strong> Predição de um de 6 estados heurísticos (FSM) para regularizar as features extraídas pela rede.</p>
+<h3>2.3. Pathfinding Inimigo (A* com Cost Map de Risco)</h3>
+<p>A simulação não depende apenas de RL; para gerar o currículo, um inimigo com IA Heurística usa o Algoritmo A*. O diferencial matemático aqui é a Injeção de Custo de Ameaça no grafo de busca.</p>
+<p>Seja $C(x, y)$ o custo base de pisar num bloco $(x, y)$.
+$$C(x, y) = 1.0 \text{ (espaço livre)}$$
+$$C_{quina}(x, y) = 2.0 \text{ (se adjacente a uma parede, previne travamento)}$$</p>
+<p>A projeção de um projétil inimigo no tempo $k$ (para $k \in {0, 1, 2, 3}$ passos) altera dinamicamente o custo do bloco na matriz:
+$$C(x + v_x k, y + v_y k) \mathrel{+}= 100.0$$
+Isso transforma magicamente o A<em> de um mero buscador de caminhos para um </em><em>algoritmo de evasão de ameaças</em>*, pois o custo letal faz a heurística desviar dos tiros no ar.</p>
+<hr />
+<h2>3. Reward Shaping (Matemática da Recompensa)</h2>
+<p>Em RL clássico, recompensas esparsas (como receber <code>+1</code> ao matar ou <code>-1</code> ao morrer) tornam o aprendizado impossível em cenários densos. O projeto injeta recompensas auxiliares densas a cada tick (frame).</p>
+<p>A Recompensa total por tick $R_t$ é a soma de funções de ganho e penalidade:
+$$R_t = R_{dano} + R_{drop} - P_{tempo} - P_{campismo} - P_{ameaça}$$</p>
+<ol>
+<li><strong>Penalidade de Tempo ($P_{tempo}$):</strong> Escala linearmente entre <code>0.005</code> e <code>0.01</code> por tick com o progresso do currículo. Garante que o agente minimize a duração do episódio $\min \sum_{t=0}^{T} t$.</li>
+<li><strong>Penalidade de Campismo ($P_{campismo}$):</strong> Seja $\vec{p}<em>t$ a posição do agente no tempo $t$. Se $|\vec{p}_t - \vec{p}</em>{t-20}|_2 &lt; 2.0$, aplica-se uma punição. Isso destroça o "<em>Mode Collapse</em>" onde o agente descobre que ficar parado é o modo mais seguro de sobreviver.</li>
+<li><strong>Punição de Alinhamento Balístico ($P_{ameaça}$):</strong> Penaliza o agente severamente se ele permanecer na rota de colisão de um projétil inimigo. Seja $\vec{d}$ o vetor do projétil para o agente e $\vec{v}<em>{proj}$ a velocidade do tiro:
+   $$ \text{Alinhamento} = \frac{\vec{v}</em>{proj} \cdot \vec{d}}{|\vec{v}<em>{proj}| |\vec{d}|} $$
+   Se $\text{Alinhamento} &gt; 0.85$, uma punição proporcional à proximidade é extraída: $P</em>{ameaça} \propto (15.0 - |\vec{d}|)$.</li>
+</ol>
+<hr />
+<h2>4. O Cérebro Neural: Arquitetura Actor-Critic e Episodic Memory</h2>
+<p>O modelo neural processa as matrizes e sensores para decidir ações (Actor) e prever o valor do estado (Critic).</p>
+<h3>4.1. Backbone Convolucional e ResNet</h3>
+<p>A entrada visual passa por três blocos de Convolução bidimensional. No Nível de Complexidade 2, <strong>Blocos ResNet</strong> (Residual Networks) são ativados.
+As conexões residuais previnem o desvanecimento do gradiente (<em>Vanishing Gradient</em>):
+$$ H(x) = \text{ReLU}(F(x, {W_i}) + x) $$
+Onde $x$ é a entrada da camada e $F(x)$ representa a transformação matricial dos filtros convolucionais. Isso permite que a rede "memorize" a identidade do mapa caso os novos filtros degradem a feature visual original.</p>
+<h3>4.2. Memória Episódica (Self-Attention Layer)</h3>
+<p>Ao invés de uma LSTM clássica, a temporalidade ($8$ frames) é tratada por um mecanismo de atenção (Transformer).
+Para os embeddings $Z = [z_1, z_2, ..., z_8]$, projetamos Matrizes de Query ($Q$), Key ($K$) e Value ($V$):
+$$ \text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V $$
+A vantagem do Self-Attention sobre LSTMs é que o último estado oculto $z_8$ tem acesso "O(1)" imediato e irrestrito ao que aconteceu em $z_1$, aprendendo a correlacionar a trajetória balística de projéteis com precisão absurda sem a degradação temporal das células recorrentes.</p>
+<h3>4.3. Action Masking Algébrico (Masked Softmax)</h3>
+<p>A rede sempre gera <em>logits</em> brutos $L \in \mathbb{R}^5$ para o movimento. Para evitar que o agente tente andar contra a parede, as rotas inválidas recebem um logit negativo colossal:
+$$ L_{safe}^{(i)} = \begin{cases} L^{(i)} &amp; \text{se } \text{mask}^{(i)} == \text{True} \ -10^{7} &amp; \text{se } \text{mask}^{(i)} == \text{False} \end{cases} $$
+Quando submetido à função $\text{softmax}(L_{safe})$, a probabilidade das ações bloqueadas colapsa microscopicamente para $0.0$, garantindo que a amostragem categórica no JAX e os cálculos logarítmicos dos gradientes permaneçam estáveis, sem gerar temidos <code>NaNs</code> (Not a Number) por causa de $\log(0)$.</p>
+<hr />
+<h2>5. O Algoritmo de Treinamento: Proximal Policy Optimization (PPO)</h2>
+<p>O agente é treinado pelo poderoso PPO, algoritmo Policy Gradient de confiança da OpenAI (usado também no ChatGPT/InstructGPT).</p>
+<h3>5.1. Estimativa da Vantagem Generalizada (GAE)</h3>
+<p>O GAE calcula quão melhor foi a ação tomada em relação ao que o Critic esperava.
+O Erro de Diferença Temporal (TD Error) no frame $t$ é:
+$$ \delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) $$
+A Vantagem Generalizada $\hat{A}<em>t$ acumula os erros decaindo-os por um fator $\lambda$:
+$$ \hat{A}_t = \sum</em>{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l} $$</p>
+<h3>5.2. Função de Custo Clipada (Clipped Surrogate Loss)</h3>
+<p>Se a rede der um salto enorme nos pesos que arruine a política, ela vai desaprender tudo (Catastrophic Forgetting). O PPO impede isso cortando o tamanho máximo da atualização.
+Seja a razão de probabilidade $r_t(\theta) = \frac{\pi_\theta(a_t | s_t)}{\pi_{old}(a_t | s_t)}$. A Perda da Política (Policy Loss) a ser minimizada é o recíproco do ganho máximo:
+$$ L^{CLIP}(\theta) = - \hat{E}_t \left[ \min\left( r_t(\theta)\hat{A}_t, \text{clip}(r_t(\theta), 1 - \epsilon, 1 + \epsilon) \hat{A}_t \right) \right] $$
+Com o hiperparâmetro de clipping $\epsilon = 0.2$, se a vantagem for positiva e a rede nova sugerir mais de <code>20%</code> de aumento de probabilidade, o gradiente vira <code>0</code>, freando a atualização excessiva.</p>
+<hr />
+<h2>6. Continuous Curriculum Learning (Interpolação Suave)</h2>
+<p>Ao invés de níveis "fase 1, fase 2", o treinamento é orquestrado por um escalar $\mathcal{C}<em>{progress} \in [0.0, 1.0]$.
+Se o agente obtiver lucro na <em>Epoch</em>, $\mathcal{C}</em>{progress}$ sobe $+0.001$.</p>
+<p>A física de todos os atributos e da Engine (velocidade do projétil inimigo, HP base, Hitboxes) sofrem transição vetorial usando <strong>Interpolação Linear (LERP)</strong>:
+$$ \text{Atributo}(t) = \text{Min} + (\text{Max} - \text{Min}) \times \mathcal{C}_{progress} $$</p>
+<p>Exemplo em código (<code>engine.py</code>):</p>
+<pre><code class="language-python">enemy_hp = self.lerp(30.0, 100.0, p) # De fraco a tanque gradativamente.
+</code></pre>
+<p>Para habilidades discretas (ex: IA passa a usar A<em> ao invés de movimento aleatório), usa-se </em><em>Threshold Masking</em>*, onde a habilidade é desbloqueada abruptamente apenas quando o risco interpolado (LERP) já preparou as reações da rede neural, reduzindo choques de dificuldade e instabilidade nos gradientes.</p>
+<hr />
+<h2>7. Técnicas SOTA (State of the Art) para Regularização</h2>
+<h3>7.1. Elastic Weight Consolidation (EWC)</h3>
+<p>Em currículos de longa duração, uma rede foca em desviar de projéteis (Dificuldade Alta) e pode "esquecer" de atirar (Dificuldade Baixa).
+O EWC protege sinapses críticas do passado. Uma âncora $\theta_{old}$ e a matriz de Fisher $F_i$ medem a importância do parâmetro $i$. A nova Loss sofre uma penalidade quadrática se a rede tentar mudar neurônios cruciais:
+$$ L_{total} = L_{PPO} + \frac{\lambda}{2} \sum_i F_i (\theta_i - \theta_{i, old})^2 $$</p>
+<h3>7.2. Cosine Annealing with Warm Restarts (SGDR)</h3>
+<p>Ao invés de baixar a taxa de aprendizado (Learning Rate - $LR$) infinitamente até o agente estagnar em mínimos locais, a classe de otimização no <code>train.py</code> (via Optax) aplica resfriamentos ciclícos.
+O $LR$ decai exponencialmente para perto de zero e então tem um salto agressivo para $3 \times 10^{-4}$ (Warm Restart), permitindo que a geometria da descida de gradiente explore topologias novas no espaço paramétrico antes de sedimentar pesos localmente de novo.</p>
+<h3>7.3. Self-Play Assíncrono via Pool Histórico</h3>
+<p>Durante as partidas paralelizadas, em um percentual dos mundos oponente não é guiado pela Engine, mas por uma cópia congelada do próprio modelo de períodos passados (<code>historical_params_pool</code>). O JAX bloqueia retropropagação na rede oponente (<code>jax.lax.stop_gradient</code>) para salvar computação. Isso garante generalização infinita, pois à medida que o Agente principal fica escorregadio e afiado, seus oponentes acompanham o ritmo e as táticas de forma autossustentável (A corrida armamentista do Reinforcement Learning).</p>
+<hr />
+<h2>8. Conclusão</h2>
+<p>O <em>Tensor Mage Arena</em> transcende um ambiente toy de RL. Através da fusão de processamento matricial (JAX/Flax), arquiteturas modulares temporais (Transformers e ResNets), regularização matemática (EWC e SGDR) e currículo ininterrupto, constrói-se um laboratório de hiper-complexidade onde capacidades cognitivas como Fuga, Perseguição, Pathfinding e Gestão de Risco emergem puramente a partir da maximização da equação de Bellman modificada por Reward Shaping tático.</p>
+    </div>
+</body>
+</html>

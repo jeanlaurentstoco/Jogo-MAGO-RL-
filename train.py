@@ -554,8 +554,9 @@ def run_training_loop(epochs=100000):
         latest_progress = 0.0
 
     if checkpoint_file:
-        curriculum_progress = max(0.0, latest_progress) if latest_progress >= 0 else 0.0
-        print(f"Carregando pesos de: {checkpoint_file} (Progress detectado: {curriculum_progress})")
+        # Força o currículo a começar do zero (0.0) para reaprender com a IA fraca
+        curriculum_progress = 0.0
+        print(f"Carregando pesos de: {checkpoint_file} (Mas forçando Progress para: {curriculum_progress} a pedido do usuário)")
         params = load_and_grow_checkpoint(checkpoint_file, model, rng, dummy_spatial, dummy_scalar, dummy_mask)
         state = create_train_state(rng, model, loaded_params=params)
     else:
@@ -600,8 +601,8 @@ def run_training_loop(epochs=100000):
         for epoch in range(1, epochs + 1):
             start_t = time.time()
             
-            # chance_self_play = max(0.0, min(1.0, (curriculum_progress - 0.80) / 0.20))
-            chance_self_play = 1.0 # 100% Self-Play forçado
+            # Desativando Self-Play a pedido do usuário
+            chance_self_play = 0.0
             # O EWC não será mais zerado no Self-Play para evitar catastrophic forgetting das habilidades básicas (mira/navegação)
             
             supervisionar = os.path.exists("ver.txt")
@@ -684,7 +685,8 @@ def run_training_loop(epochs=100000):
                             e_act = {
                                 "move_idx": int(e_act_dict["move"][i]),
                                 "aim": np.array(e_act_dict["aim"][i]),
-                                "intent": np.array(jax.nn.softmax(e_act_dict["intent"][i]))
+                                "intent": np.array(jax.nn.softmax(e_act_dict["intent"][i])),
+                                "shoot": True
                             }
                             enemy_actions.append(e_act)
                 
@@ -915,11 +917,11 @@ def run_training_loop(epochs=100000):
                     ])
                 
                 # --- PROGRESSÃO CONTÍNUA DO CURRÍCULO ---
-                # Incrementa curriculum_progress em +0.005 quando recompensa média é positiva
-                if curriculum_unlocked and epoch_total_reward > 0 and curriculum_progress < 1.0:
+                # Incrementa curriculum_progress se a taxa de vitória (SR) estiver alta (>= 60%), ignorando a precisão (que cai quando as paredes surgem)
+                if curriculum_unlocked and epoch_total_reward > 0 and sr >= 60.0 and curriculum_progress < 1.0:
                     old_progress = curriculum_progress
-                    curriculum_progress = min(1.0, curriculum_progress + 0.005)
-                    env.update_curriculum(0.005)
+                    curriculum_progress = min(1.0, curriculum_progress + 0.02)
+                    env.update_curriculum(0.02)
                     
                     # Ancora EWC a cada 0.1 de avanço
                     if int(curriculum_progress * 10) > int(old_progress * 10):

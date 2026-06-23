@@ -65,6 +65,7 @@ class Renderer:
         self.use_bot = False
         self.spectator = spectator
         self.bot_params = None
+        self.bot_apply = None
         
         if HAS_MODEL and model_file and os.path.exists(model_file):
             print(f"Carregando o Bot Neural treinado: {model_file}")
@@ -76,12 +77,17 @@ class Renderer:
             self.bot_params = model.init(rng, dummy_spatial, dummy_scalar, dummy_mask)
             with open(model_file, "rb") as f:
                 self.bot_params = flax.serialization.from_bytes(self.bot_params, f.read())
+            self.bot_apply = jax.jit(model.apply)
+            print("Compilando IA (Isso pode levar alguns segundos)...")
+            _ = self.bot_apply(self.bot_params, dummy_spatial, dummy_scalar, dummy_mask)
+            print("IA compilada e pronta para o combate!")
             self.use_bot = True
         
         # --- Sistema LLM Tático + Áudio Provocador ---
         self.tactical_llm = None
         self.audio_worker = None
         self.game_tick = 0
+        self.human_shoot_cooldown = 0
         self.audio_worker = AudioProvocateur(
             event_queue=self.engine.event_queue,
             cooldown_seconds=0
@@ -243,10 +249,19 @@ class Renderer:
         aim_x = mouse_pos[0] - px_screen
         aim_y = mouse_pos[1] - py_screen
         
+        shoot_cmd = False
+        if mouse_buttons[0] and self.human_shoot_cooldown == 0:
+            shoot_cmd = True
+            self.human_shoot_cooldown = 20  # Cooldown do click (ajustado com a engine)
+            
+        if self.human_shoot_cooldown > 0:
+            self.human_shoot_cooldown -= 1
+        
         return {
             "move": [dx, dy],
             "aim": [aim_x, aim_y],
-            "shoot": mouse_buttons[0] # Botão esquerdo
+            "shoot": shoot_cmd,
+            "human_playing": True
         }
 
     def get_intent_from_state(self, state):
@@ -304,12 +319,11 @@ class Renderer:
                     scalars = obs["scalar_obs"][np.newaxis, ...]
                     mask = obs["action_mask"][np.newaxis, ...]
                     
-                    model = ActorCritic()
-                    logits, _ = model.apply(self.bot_params, jnp.array(spatial), jnp.array(scalars), jnp.array(mask))
+                    logits = self.bot_apply(self.bot_params, jnp.array(spatial), jnp.array(scalars), jnp.array(mask))
                     
                     move_idx = int(np.argmax(np.array(logits["move"][0])))
                     aim = np.array(logits["aim"][0])
-                    shoot = (np.argmax(np.array(logits["shoot"][0])) == 1)
+                    shoot = True
                     
                     action["move_idx"] = move_idx
                     action["aim"] = aim
@@ -347,12 +361,11 @@ class Renderer:
                         elif state["walls"][int(nx), int(ny)]:
                             mask[0, i] = False
                     
-                    model = ActorCritic()
-                    logits, _ = model.apply(self.bot_params, jnp.array(spatial), jnp.array(scalars), jnp.array(mask))
+                    logits = self.bot_apply(self.bot_params, jnp.array(spatial), jnp.array(scalars), jnp.array(mask))
                     
                     move_idx = int(np.argmax(np.array(logits["move"][0])))
                     aim = np.array(logits["aim"][0])
-                    shoot = (np.argmax(np.array(logits["shoot"][0])) == 1)
+                    shoot = True
                     
                     enemy_action = {"move_idx": move_idx, "aim": aim, "shoot": shoot}
 
@@ -370,8 +383,8 @@ class Renderer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Renderer for Tensor Mage Arena")
-    parser.add_argument("--model", type=str, default="", help="Caminho para o modelo (ex: modelo_progress_0.50.msgpack)")
-    parser.add_argument("--progress", type=float, default=0.0, help="Progresso do currículo (0.0 a 1.0)")
+    parser.add_argument("--model", type=str, default="melhor/modelo_treinado.msgpack", help="Caminho para o modelo (ex: modelo_progress_0.50.msgpack)")
+    parser.add_argument("--progress", type=float, default=1.0, help="Progresso do currículo (0.0 a 1.0)")
     parser.add_argument("--play", action="store_true", help="Se informado com --model, você joga (Azul) contra o bot (Vermelho)")
     args = parser.parse_args()
     
